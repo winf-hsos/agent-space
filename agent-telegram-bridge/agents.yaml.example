@@ -1,0 +1,28 @@
+# agents.yaml — copy to agents.yaml and fill in real values.
+# workdir paths are machine-specific: set them for this server.
+# Tokens stay in .env — never put them here.
+
+concurrency: 1  # max agents running at once; keep at 1-2 on a Raspberry Pi
+
+agents:
+  - name: example
+    token_env: EXAMPLE_BOT_TOKEN          # must match a key in .env
+    allowed_ids: [YOUR_TELEGRAM_CHAT_ID]  # find via api.telegram.org/bot<TOKEN>/getUpdates
+    workdir: /home/pi/agent-space/agents/example-agent  # absolute path on THIS machine
+    continue: false   # true = keep OpenCode session memory between messages
+    timeout: 120
+    history: 10       # replay last N messages as context (0 = off)
+
+  # Add your own agents here. Each needs a matching token in .env.
+  # - name: wiki
+  #   token_env: WIKI_BOT_TOKEN
+  #   allowed_ids: [YOUR_TELEGRAM_CHAT_ID]
+  #   workdir: /home/pi/agent-space/agents/wiki-agent
+  #   continue: false
+  #   model: openai/gpt-4o-mini  # provider/model; omit to use OpenCode default
+  #   timeout: 600
+  #   history: 20
+  #   # schedules:
+  #   #   - cron: "0 8 * * *"
+  #   #     prompt: "Morning check-in."
+  #   #     chat_id: YOUR_TELEGRAM_CHAT_ID

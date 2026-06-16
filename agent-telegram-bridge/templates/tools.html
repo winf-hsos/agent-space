@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Tools — Agent Manager{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-8">
+  <div>
+    <h1 class="text-2xl font-semibold text-slate-100">Shared Tools</h1>
+    <p class="text-slate-500 text-sm mt-1">Each tool lives in its own subfolder and is available on every agent's PATH.</p>
+  </div>
+  <button onclick="document.getElementById('new-tool-modal').classList.remove('hidden')"
+          class="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+    </svg>
+    New Tool
+  </button>
+</div>
+
+{% if not tools %}
+<div class="flex flex-col items-center justify-center py-24 text-center">
+  <div class="w-16 h-16 rounded-2xl bg-slate-800 flex items-center justify-center mb-4 text-3xl">🔧</div>
+  <h2 class="text-lg font-medium text-slate-300 mb-1">No tools yet</h2>
+  <p class="text-slate-500 text-sm mb-6">Create a tool to make it available to all agents.</p>
+  <button onclick="document.getElementById('new-tool-modal').classList.remove('hidden')"
+          class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+    Create a tool
+  </button>
+</div>
+{% else %}
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+  {% for tool in tools %}
+  <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden hover:border-slate-700 transition-colors">
+    <div class="h-1 bg-gradient-to-r from-violet-600 to-violet-400"></div>
+    <div class="p-5">
+      <div class="flex items-start justify-between mb-3">
+        <div>
+          <h2 class="text-base font-semibold text-slate-100 font-mono">{{ tool.name }}</h2>
+          <p class="text-xs text-slate-500 mt-0.5">{{ tool.files | length }} file{{ 's' if tool.files | length != 1 }}</p>
+        </div>
+        <span class="text-xs px-2 py-0.5 rounded-full bg-violet-950 text-violet-400">tool</span>
+      </div>
+
+      <!-- File list preview -->
+      <div class="mb-4 space-y-1">
+        {% for f in tool.files[:5] %}
+        <div class="flex items-center gap-2 text-xs text-slate-400 font-mono">
+          <svg class="w-3 h-3 text-slate-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          {{ f }}
+        </div>
+        {% endfor %}
+        {% if tool.files | length > 5 %}
+        <p class="text-xs text-slate-600 pl-5">+{{ tool.files | length - 5 }} more</p>
+        {% endif %}
+      </div>
+
+      <div class="flex items-center gap-2">
+        <a href="/tools/{{ tool.name }}"
+           class="flex-1 text-center text-sm px-3 py-1.5 rounded-lg bg-violet-700 hover:bg-violet-600 text-white font-medium transition-colors">
+          Edit
+        </a>
+        <button onclick="confirmDeleteTool('{{ tool.name }}')"
+                class="text-sm px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-400 font-medium transition-colors">
+          Delete
+        </button>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- New tool modal -->
+<div id="new-tool-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80">
+  <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-80 shadow-2xl">
+    <h2 class="text-base font-semibold text-slate-100 mb-4">New Tool</h2>
+    <form method="POST" action="/tools/new">
+      <label class="text-xs text-slate-500 block mb-1.5">Tool name <span class="text-slate-600">(lowercase, no spaces)</span></label>
+      <input name="name" type="text" required autofocus
+             placeholder="my-tool"
+             class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 mb-4">
+      <p class="text-xs text-slate-500 mb-4">Creates <code class="text-slate-400">agent-tools/{name}/</code> with a Python starter, POSIX wrapper, and Windows <code class="text-slate-400">.cmd</code> shim.</p>
+      <div class="flex gap-2">
+        <button type="submit"
+                class="flex-1 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+          Create
+        </button>
+        <button type="button" onclick="document.getElementById('new-tool-modal').classList.add('hidden')"
+                class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium transition-colors">
+          Cancel
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Delete form (hidden) -->
+<form id="delete-tool-form" method="POST" action="" style="display:none"></form>
+{% endblock %}
+
+{% block scripts %}
+function confirmDeleteTool(name) {
+  if (!confirm('Delete tool "' + name + '" and all its files? This cannot be undone.')) return;
+  const f = document.getElementById('delete-tool-form');
+  f.action = '/tools/' + name + '/delete';
+  f.submit();
+}
+// Close modal on backdrop click
+document.getElementById('new-tool-modal').addEventListener('click', function(e) {
+  if (e.target === this) this.classList.add('hidden');
+});
+{% endblock %}

@@ -1,0 +1,720 @@
+﻿"""
+Multi-bot Telegram -> OpenCode bridge.
+
+Runs several Telegram bots from a single process. Each bot is backed by its own
+OpenCode agent: its own working directory (with its own AGENTS.md), its own
+allowed users, and its own session behavior. Bots are declared in agents.yaml;
+secrets (tokens) stay in environment variables / a .env file.
+
+Design:
+  - One *poller* thread per bot long-polls Telegram (each token needs its own
+    getUpdates consumer) and enqueues messages.
+  - One *worker* thread per bot processes that bot's messages strictly in order
+    -- which keeps `continue` sessions and wiki writes consistent.
+  - A single global semaphore (`concurrency` in agents.yaml) caps how many agents
+    run at the same time across ALL bots. This is the key guard on small
+    hardware like a Raspberry Pi 5.
+
+Setup:
+  1. npm install -g opencode-ai   &&   opencode auth login
+  2. Create each bot via @BotFather; put its token in .env.
+  3. pip install -r requirements.txt
+  4. Edit agents.yaml, then run:  python telegram_agent.py
+
+Env vars:
+  <token_env>    - one per agent, named in agents.yaml (e.g. TELEGRAM_BOT_TOKEN)
+  AGENTS_CONFIG  - optional, path to the YAML config (default: agents.yaml next to this file)
+  OPENCODE_BIN  - optional, explicit path to the opencode executable
+"""
+
+import contextlib
+import html
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+import requests
+import yaml
+from dotenv import load_dotenv
+
+try:
+    from croniter import croniter  # for cron `schedules` in agents.yaml
+except ImportError:
+    croniter = None
+
+load_dotenv()  # read variables from a .env file next to this script
+
+BRIDGE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.environ.get("AGENTS_CONFIG", BRIDGE_DIR / "agents.yaml"))
+# Shared toolbox put on every agent's PATH (see run_agent), e.g. the `remind`
+# command. Kept OUTSIDE the bridge folder on purpose: agents have shell access,
+# so anything reachable via PATH must not sit next to the .env with the tokens.
+TOOLS_DIR = Path(
+    os.environ.get("AGENT_TOOLS_DIR", BRIDGE_DIR.parent / "agent-tools")
+).resolve()
+# Shared instructions appended to every agent (via each workdir's opencode.json
+# `instructions`). Maintain once here; all agents pick it up. See
+# ensure_shared_instructions().
+SHARED_INSTRUCTIONS = TOOLS_DIR / "shared" / "agents-common.md"
+TELEGRAM_LIMIT = 4096
+RUN_TIMEOUT = 600  # seconds an agent may work on a single message
+REMINDER_PREFIX = "Erinnerung"  # bold label prepended to delivered reminders
+HISTORY_DIR = BRIDGE_DIR / "history"  # per-bot, per-chat conversation logs
+HISTORY_CAP = 1000  # max lines kept on disk per chat (older lines are dropped)
+
+# Voice transcription (OpenAI Whisper API). Needs OPENAI_API_KEY in the env.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "whisper-1")
+
+# Caps concurrent agent runs across all bots; replaced in main() from the config.
+AGENT_SLOTS = threading.Semaphore(1)
+
+
+def _resolve_opencode():
+    """Locate the opencode executable, preferring the real binary over shims.
+
+    On Windows, shutil.which() returns npm's opencode.cmd/.ps1 shim. Running a
+    .cmd routes through cmd.exe, which treats a newline in an argument as a
+    command separator and truncates multi-line prompts at the first line. The
+    shim itself just launches a real opencode.exe, so we resolve to that exe
+    (mirroring the shim's own path) to pass arguments untouched.
+    """
+    override = os.environ.get("OPENCODE_BIN")
+    if override:
+        return override
+    found = shutil.which("opencode")
+    if found and os.name == "nt" and found.lower().endswith((".cmd", ".bat", ".ps1")):
+        exe = Path(found).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+        if exe.exists():
+            return str(exe)
+    return found
+
+
+OPENCODE = _resolve_opencode()
+
+
+# --------------------------------------------------------------------------- #
+# OpenCode
+# --------------------------------------------------------------------------- #
+
+def extract_answer(stdout: str) -> str:
+    """Reconstruct just the assistant's final answer from opencode's JSONL events.
+
+    `opencode run --format json` emits one JSON event per line: step_start,
+    tool_use, text, step_finish, error. The reply lives in `text` events. A model
+    often writes text BEFORE/BETWEEN tool calls ("I'll set the reminder...") and
+    again AFTER it ("Done, I'll remind you..."), which would otherwise reach the
+    chat as two messages. So we keep only the text emitted after the LAST tool
+    call -- the actual conclusion -- and fall back to all text when no tool ran.
+    Each part id is deduped to its latest snapshot; distinct parts join with a
+    blank line so boundaries don't glue words together.
+    """
+    parts: dict = {}      # part id -> latest text snapshot
+    order: list = []      # part ids in first-appearance order
+    last_tool_pos = -1    # how many text parts had appeared when the last tool ran
+    errors = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type", "")
+        part = event.get("part") or {}
+        if etype == "text":
+            text = part.get("text")
+            if text:
+                pid = part.get("id", f"_{len(order)}")
+                if pid not in parts:
+                    order.append(pid)
+                parts[pid] = text
+        elif etype.startswith("tool"):
+            last_tool_pos = len(order)  # text appearing after this is the conclusion
+        elif etype == "error":
+            errors.append(str(part.get("text") or event.get("error") or "unknown error"))
+
+    # Prefer text emitted after the final tool call; if there is none, use all of
+    # it (covers plain answers with no tool, or a tool with no trailing text).
+    final = [pid for pid in order[last_tool_pos:] if parts[pid].strip()] if last_tool_pos >= 0 else []
+    if not final:
+        final = [pid for pid in order if parts[pid].strip()]
+    answer = "\n\n".join(parts[pid].strip() for pid in final).strip()
+    if not answer and errors:
+        return "[agent error] " + " ".join(errors)
+    return answer
+
+
+def run_agent(workdir: Path, keep_context: bool, prompt: str,
+              model: str | None = None, timeout: int = RUN_TIMEOUT,
+              chat_id: int | None = None) -> str:
+    """Run one prompt through the opencode CLI and return only the final answer."""
+    if OPENCODE is None:
+        return "opencode CLI not found on PATH. Run: npm install -g opencode-ai"
+    cmd = [OPENCODE, "run", "--format", "json"]
+    if keep_context:
+        cmd.append("-c")  # resume previous session => the agent remembers context
+    if model:
+        cmd += ["-m", model]  # provider/model, e.g. anthropic/claude-sonnet-4-6
+    cmd.append(prompt)
+    # Put every tool subfolder on the agent's PATH so tools are callable by name.
+    # Each tool lives in its own subfolder (e.g. agent-tools/remind/); the folder
+    # name is excluded from PATH, only the subfolders are added.
+    env = os.environ.copy()
+    if TOOLS_DIR.exists():
+        tool_dirs = sorted(
+            str(d) for d in TOOLS_DIR.iterdir()
+            if d.is_dir() and d.name != "shared"
+        )
+        if tool_dirs:
+            env["PATH"] = os.pathsep.join(tool_dirs) + os.pathsep + env.get("PATH", "")
+    if chat_id is not None:
+        env["TELEGRAM_CHAT_ID"] = str(chat_id)
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",  # opencode emits UTF-8; don't decode as cp1252 on Windows
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Agent timed out after {timeout}s."
+    answer = extract_answer(result.stdout or "")
+    if answer:
+        return answer
+    err = (result.stderr or "").strip()
+    return f"[agent error]\n{err}" if err else "(no output)"
+
+
+# --------------------------------------------------------------------------- #
+# Telegram
+# --------------------------------------------------------------------------- #
+
+def send(api: str, chat_id: int, text: str, parse_mode: str | None = None) -> None:
+    """Send a reply, splitting on Telegram's 4096-char limit.
+
+    parse_mode is left unset for normal agent replies (plain text, no escaping
+    needed). Pass "HTML" for messages the bridge formats itself (e.g. reminders);
+    any dynamic text in those must be html.escape()'d by the caller first.
+    """
+    text = text or "(no output)"
+    for i in range(0, len(text), TELEGRAM_LIMIT):
+        payload = {"chat_id": chat_id, "text": text[i : i + TELEGRAM_LIMIT]}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        requests.post(f"{api}/sendMessage", json=payload, timeout=30)
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+# The agent emits this marker to have the bridge send a file; it is removed from
+# the visible reply. e.g.  [[send: wiki/files/chart.png]]
+SEND_MARKER = re.compile(r"\[\[send:\s*(.+?)\]\]")
+
+
+def http(method: str, url: str, **kwargs):
+    """requests with a few retries for transient connection resets on flaky
+    networks (e.g. a firewall that intermittently drops connections)."""
+    last = None
+    for attempt in range(3):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise last
+
+
+def download_file(bot: "Bot", file_id: str, suggested_name: str | None = None) -> Path:
+    """Download a Telegram file into the bot's inbox/ folder and return its path."""
+    meta = http("GET", f"{bot.api}/getFile", params={"file_id": file_id}, timeout=30).json()
+    file_path = meta["result"]["file_path"]  # e.g. "documents/file_5.pdf"
+    data = http(
+        "GET", f"https://api.telegram.org/file/bot{bot.token}/{file_path}", timeout=120
+    ).content
+    name = Path(suggested_name).name if suggested_name else os.path.basename(file_path)
+    inbox = bot.workdir / "inbox"
+    inbox.mkdir(exist_ok=True)
+    dest = inbox / f"{int(time.time())}_{name or file_id}"
+    dest.write_bytes(data)
+    return dest
+
+
+def transcribe(path: Path) -> str:
+    """Transcribe an audio file to text via the OpenAI Whisper API.
+
+    The API accepts OGG/Opus (Telegram voice notes) directly, so no conversion
+    is needed. Returns "" if no API key is configured.
+    """
+    if not OPENAI_API_KEY:
+        return ""
+    audio = path.read_bytes()  # read once so retries can resend it
+    resp = http(
+        "POST",
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        data={"model": TRANSCRIBE_MODEL},
+        files={"file": (path.name, audio, "audio/ogg")},
+        timeout=120,
+    )
+    return resp.json().get("text", "").strip()
+
+
+def history_path(bot: "Bot", chat_id: int) -> Path:
+    return HISTORY_DIR / f"{bot.name}_{chat_id}.jsonl"
+
+
+def read_history(bot: "Bot", chat_id: int, n: int) -> list:
+    """Return up to the last n logged messages for this chat (oldest first)."""
+    if n <= 0:
+        return []
+    p = history_path(bot, chat_id)
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines()[-n:]:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def log_turn(bot: "Bot", chat_id: int, user_text, agent_text) -> None:
+    """Append a user message and/or agent reply to this chat's history file.
+
+    No-op unless the bot has history enabled. Either side may be empty (e.g. a
+    proactive run logs only the agent's message). The file is trimmed to the last
+    HISTORY_CAP lines so it can't grow without bound.
+    """
+    if bot.history <= 0:
+        return
+    now = int(time.time())
+    entries = []
+    if user_text and user_text.strip():
+        entries.append({"t": now, "role": "user", "text": user_text.strip()})
+    if agent_text and agent_text.strip():
+        entries.append({"t": now, "role": "agent", "text": agent_text.strip()})
+    if not entries:
+        return
+    HISTORY_DIR.mkdir(exist_ok=True)
+    p = history_path(bot, chat_id)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    lines += [json.dumps(e, ensure_ascii=False) for e in entries]
+    if len(lines) > HISTORY_CAP:
+        lines = lines[-HISTORY_CAP:]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def history_block(entries: list) -> str:
+    """Format logged messages as a context preamble for the prompt."""
+    if not entries:
+        return ""
+    body = "\n".join(
+        f"{'User' if e.get('role') == 'user' else 'You'}: {e.get('text', '')}"
+        for e in entries
+    )
+    return (
+        "[Recent chat history with the user, oldest first, for context only. "
+        "Do not respond to these old messages -- only to the new message below.]\n"
+        f"{body}\n[End of history]"
+    )
+
+
+def build_prompt(text: str, files: list) -> str:
+    """Combine the user's text/caption with a note about any attached files."""
+    if not files:
+        return text
+    listing = "\n".join(f"- {p}" for p in files)
+    note = (
+        "[The user attached files, saved to disk for you to open and process "
+        f"according to your instructions:\n{listing}\n]"
+    )
+    return f"{text}\n\n{note}" if text else note
+
+
+def split_outgoing(reply: str, workdir: Path):
+    """Pull [[send: path]] markers out of a reply; return (clean_text, [paths])."""
+    paths = []
+    for m in SEND_MARKER.finditer(reply):
+        raw = m.group(1).strip().strip("\"'")
+        p = Path(raw)
+        if not p.is_absolute():
+            p = workdir / p
+        paths.append(p)
+    clean = SEND_MARKER.sub("", reply).strip()
+    return clean, paths
+
+
+def send_file(api: str, chat_id: int, path: Path) -> None:
+    """Send a local file as a photo (if an image) or document."""
+    if not path.exists():
+        send(api, chat_id, f"(could not find file to send: {path.name})")
+        return
+    is_image = path.suffix.lower() in IMAGE_EXTS
+    method, field = ("sendPhoto", "photo") if is_image else ("sendDocument", "document")
+    with open(path, "rb") as fh:
+        requests.post(
+            f"{api}/{method}",
+            data={"chat_id": chat_id},
+            files={field: fh},
+            timeout=120,
+        )
+
+
+@contextlib.contextmanager
+def typing_indicator(api: str, chat_id: int):
+    """Keep Telegram's 'typing...' visible for the whole block.
+
+    A single sendChatAction only lasts ~5s, so we re-send it every 4s on a
+    background thread until the block exits (i.e. until the reply is ready).
+    """
+    stop = threading.Event()
+
+    def keep_alive():
+        while not stop.is_set():
+            try:
+                requests.post(
+                    f"{api}/sendChatAction",
+                    json={"chat_id": chat_id, "action": "typing"},
+                    timeout=30,
+                )
+            except requests.RequestException:
+                pass
+            stop.wait(4)  # refresh before the ~5s indicator expires
+
+    t = threading.Thread(target=keep_alive, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=5)
+
+
+# --------------------------------------------------------------------------- #
+# Bots
+# --------------------------------------------------------------------------- #
+
+class Bot:
+    def __init__(self, name, token, allowed_ids, workdir, keep_context,
+                 model=None, timeout=RUN_TIMEOUT, schedules=None, default_chat_id=None,
+                 history=0):
+        self.name = name
+        self.token = token
+        self.api = f"https://api.telegram.org/bot{token}"
+        self.allowed_ids = set(allowed_ids)
+        self.workdir = workdir
+        self.keep_context = keep_context
+        self.model = model
+        self.timeout = timeout
+        self.schedules = schedules or []          # cron entries from agents.yaml
+        self.default_chat_id = default_chat_id     # for proactive msgs lacking a chat
+        self.history = history                     # how many past messages to replay
+        # each item: (chat_id, text, [(file_id, name), ...], [voice_id, ...], proactive)
+        # proactive=True for cron-triggered runs (don't log their prompt as a user msg)
+        self.queue: "queue.Queue[tuple]" = queue.Queue()
+
+
+def worker(bot: Bot) -> None:
+    """Process one bot's messages serially; the agent run is globally throttled."""
+    while True:
+        chat_id, text, attachments, voice_ids, proactive = bot.queue.get()
+        try:
+            with typing_indicator(bot.api, chat_id):
+                # Voice notes: transcribe to text and treat as the user's message.
+                for voice_id in voice_ids:
+                    try:
+                        transcript = transcribe(download_file(bot, voice_id))
+                        if transcript:
+                            text = f"{text}\n\n{transcript}" if text else transcript
+                    except Exception as e:
+                        print(f"[{bot.name}] transcription failed:", e)
+                if voice_ids and not text:
+                    send(bot.api, chat_id, "Sorry, I couldn't transcribe that voice message.")
+                    continue
+
+                files = []
+                for file_id, suggested in attachments:
+                    try:
+                        files.append(download_file(bot, file_id, suggested))
+                    except Exception as e:
+                        print(f"[{bot.name}] download failed:", e)
+                prompt = build_prompt(text, files)
+                history = read_history(bot, chat_id, bot.history)
+                if history:
+                    prompt = history_block(history) + "\n\n" + prompt
+                with AGENT_SLOTS:  # global cap: at most N agents running at once
+                    reply = run_agent(
+                        bot.workdir, bot.keep_context, prompt,
+                        model=bot.model, timeout=bot.timeout, chat_id=chat_id,
+                    )
+            clean, to_send = split_outgoing(reply, bot.workdir)
+            if clean:
+                send(bot.api, chat_id, clean)
+            for path in to_send:
+                send_file(bot.api, chat_id, path)
+            # Record the exchange for future context (no-op if history disabled).
+            # Proactive (cron) runs log only the agent's message, not their prompt.
+            if proactive:
+                user_log = None
+            else:
+                user_log = text or ("[sent a file]" if attachments else None)
+            log_turn(bot, chat_id, user_log, clean)
+        except Exception as e:  # never let one bad message kill the worker
+            print(f"[{bot.name}] worker error:", e)
+            try:
+                send(bot.api, chat_id, f"Sorry, something went wrong: {e}")
+            except Exception:
+                pass
+        finally:
+            bot.queue.task_done()
+
+
+def poller(bot: Bot) -> None:
+    """Long-poll one bot's Telegram updates and enqueue allowed messages."""
+    print(f"[{bot.name}] polling. workdir={bot.workdir} allowed={bot.allowed_ids}")
+    offset = None
+    while True:
+        try:
+            resp = requests.get(
+                f"{bot.api}/getUpdates",
+                params={"timeout": 30, "offset": offset},
+                timeout=40,
+            ).json()
+        except requests.RequestException as e:
+            print(f"[{bot.name}] poll error:", e)
+            time.sleep(3)
+            continue
+
+        for update in resp.get("result", []):
+            offset = update["update_id"] + 1
+            msg = update.get("message") or update.get("edited_message")
+            if not msg:
+                continue
+            chat_id = msg["chat"]["id"]
+            if chat_id not in bot.allowed_ids:
+                print(f"[{bot.name}] ignored message from {chat_id}")
+                continue
+
+            text = msg.get("text") or msg.get("caption") or ""
+            attachments = []  # (file_id, suggested_name) -> handed to the agent
+            voice_ids = []    # transcribed to text before reaching the agent
+            if "photo" in msg:
+                attachments.append((msg["photo"][-1]["file_id"], None))  # largest size
+            if "document" in msg:
+                doc = msg["document"]
+                attachments.append((doc["file_id"], doc.get("file_name")))
+            if "voice" in msg:
+                voice_ids.append(msg["voice"]["file_id"])
+            if "audio" in msg:
+                voice_ids.append(msg["audio"]["file_id"])
+
+            if not text and not attachments and not voice_ids:
+                continue  # ignore stickers, locations, etc.
+            print(f"[{bot.name}] > {text!r} (+{len(attachments)} file, +{len(voice_ids)} audio)")
+            bot.queue.put((chat_id, text, attachments, voice_ids, False))
+
+
+def scheduler(bot: Bot) -> None:
+    """Deliver due reminders and fire cron schedules for one bot.
+
+    Two proactive sources, checked on a short tick:
+      - reminders/   one JSON file per reminder, written by the shared `remind`
+                     tool when the agent schedules one. Delivered as plain text
+                     at its due time (no agent run needed), then deleted.
+      - schedules    cron entries from agents.yaml. At fire time the prompt is
+                     enqueued like a normal message, so the worker runs the
+                     agent and its reply is sent -- reusing the whole pipeline
+                     and counting against the global concurrency cap.
+    """
+    crons = []
+    if bot.schedules and croniter is None:
+        print(f"[{bot.name}] schedules configured but croniter is not installed; "
+              f"cron disabled. Run: pip install croniter")
+    elif croniter is not None:
+        now = datetime.now()
+        for sched in bot.schedules:
+            expr = sched["cron"]
+            try:
+                itr = croniter(expr, now)
+                crons.append({
+                    "itr": itr,
+                    "next": itr.get_next(datetime),  # don't backfill missed runs
+                    "prompt": sched["prompt"],
+                    "chat_id": sched.get("chat_id", bot.default_chat_id),
+                })
+            except (ValueError, KeyError) as e:
+                print(f"[{bot.name}] bad cron {expr!r}: {e}")
+
+    reminders_dir = bot.workdir / "reminders"
+    while True:
+        now = datetime.now()
+
+        # Due reminders -> send the stored text directly (no model call).
+        if reminders_dir.exists():
+            for f in sorted(reminders_dir.glob("*.json")):
+                try:
+                    entry = json.loads(f.read_text(encoding="utf-8"))
+                    due = datetime.fromisoformat(entry["due"])
+                except (ValueError, KeyError, OSError) as e:
+                    print(f"[{bot.name}] discarding bad reminder {f.name}: {e}")
+                    f.unlink(missing_ok=True)
+                    continue
+                if due <= now:
+                    chat_id = entry.get("chat_id", bot.default_chat_id)
+                    text = entry.get("text") or "(reminder)"
+                    try:
+                        body = f"<b>{REMINDER_PREFIX}</b>: {html.escape(text, quote=False)}"
+                        send(bot.api, chat_id, body, parse_mode="HTML")
+                        print(f"[{bot.name}] reminder delivered: {text!r}")
+                    except Exception as e:
+                        print(f"[{bot.name}] reminder send failed:", e)
+                    f.unlink(missing_ok=True)
+
+        # Cron schedules -> enqueue a prompt for the worker.
+        for c in crons:
+            if c["next"] <= now:
+                bot.queue.put((c["chat_id"], c["prompt"], [], [], True))
+                c["next"] = c["itr"].get_next(datetime)
+                print(f"[{bot.name}] cron fired; next at {c['next']:%Y-%m-%d %H:%M}")
+
+        time.sleep(15)
+
+
+# --------------------------------------------------------------------------- #
+# Config + startup
+# --------------------------------------------------------------------------- #
+
+def ensure_shared_instructions(bot: "Bot") -> None:
+    """Make sure the bot's opencode.json references the shared instructions file.
+
+    OpenCode auto-loads each workdir's AGENTS.md and *also* concatenates any files
+    listed under `instructions` in opencode.json. So the common rules live in one
+    shared file and every agent just points at it -- improvements propagate to all
+    agents at once, and a new agent needs only its own personality AGENTS.md.
+
+    The reference is stored as a path relative to the workdir (OpenCode resolves
+    `instructions` relative to the config file's directory), which also keeps the
+    whole tree portable to the Raspberry Pi. Existing config is merged, not
+    clobbered; a config file we can't parse (e.g. JSONC with comments) is left
+    untouched with a warning.
+    """
+    if not SHARED_INSTRUCTIONS.exists():
+        print(f"[{bot.name}] shared instructions file not found: {SHARED_INSTRUCTIONS}")
+    rel = os.path.relpath(SHARED_INSTRUCTIONS, bot.workdir).replace(os.sep, "/")
+    if not rel.startswith("."):
+        rel = "./" + rel
+    cfg_path = bot.workdir / "opencode.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[{bot.name}] {cfg_path.name} unreadable; leaving it untouched. "
+                  f"Add {rel!r} to its 'instructions' yourself. ({e})")
+            return
+        instr = cfg.get("instructions")
+        instr = list(instr) if isinstance(instr, list) else ([] if instr is None else [instr])
+        if rel in instr:
+            return
+        instr.append(rel)
+        cfg["instructions"] = instr
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        print(f"[{bot.name}] linked shared instructions in {cfg_path.name}")
+    else:
+        cfg_path.write_text(json.dumps({"instructions": [rel]}, indent=2) + "\n",
+                            encoding="utf-8")
+        print(f"[{bot.name}] created {cfg_path.name} referencing shared instructions")
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"Config not found: {CONFIG_PATH}")
+    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    concurrency = int(cfg.get("concurrency", 1))
+    bots = []
+    for entry in cfg.get("agents", []):
+        name = entry.get("name", "?")
+
+        token_env = entry.get("token_env")
+        token = os.environ.get(token_env) if token_env else None
+        if not token:
+            raise SystemExit(f"Bot '{name}': env var {token_env!r} is not set.")
+
+        workdir = Path(entry["workdir"]).resolve()
+        # Safety: the agent has file/shell access scoped to its workdir. Refuse
+        # to start if that workdir equals or contains the bridge folder (which
+        # holds this script and the .env with every bot token).
+        if workdir == BRIDGE_DIR or workdir in BRIDGE_DIR.parents:
+            raise SystemExit(
+                f"Bot '{name}': workdir ({workdir}) is the same as, or a parent "
+                f"of, the bridge folder ({BRIDGE_DIR}). The agent could then read "
+                f"your .env / bot tokens. Point it at a separate folder."
+            )
+        if not workdir.exists():
+            raise SystemExit(f"Bot '{name}': workdir does not exist: {workdir}")
+
+        allowed = {int(x) for x in entry.get("allowed_ids", [])}
+        if not allowed:
+            raise SystemExit(
+                f"Bot '{name}': allowed_ids is empty -- refusing to run an open bot."
+            )
+
+        keep_context = bool(entry.get("continue", False))
+        model = entry.get("model")  # None => opencode uses its configured default
+        timeout = int(entry.get("timeout", RUN_TIMEOUT))
+
+        schedules = entry.get("schedules") or []
+        for s in schedules:
+            if not s.get("cron") or not s.get("prompt"):
+                raise SystemExit(
+                    f"Bot '{name}': each schedule needs both 'cron' and 'prompt'."
+                )
+        # Reminders/cron without an explicit chat default to the lowest allowed id.
+        default_chat_id = sorted(allowed)[0]
+        history = int(entry.get("history", 0))  # 0/absent = off
+        bots.append(Bot(name, token, allowed, workdir, keep_context, model,
+                        timeout, schedules, default_chat_id, history))
+
+    if not bots:
+        raise SystemExit(f"No bots configured in {CONFIG_PATH}.")
+    return concurrency, bots
+
+
+def main() -> None:
+    global AGENT_SLOTS
+    concurrency, bots = load_config()
+    AGENT_SLOTS = threading.Semaphore(concurrency)
+    print(
+        f"Starting {len(bots)} bot(s); max {concurrency} agent(s) at once. "
+        f"opencode={OPENCODE}"
+    )
+    for bot in bots:
+        ensure_shared_instructions(bot)
+        threading.Thread(target=worker, args=(bot,), daemon=True).start()
+        threading.Thread(target=poller, args=(bot,), daemon=True).start()
+        threading.Thread(target=scheduler, args=(bot,), daemon=True).start()
+
+    # Block forever; daemon threads do the work. Ctrl+C to stop.
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("Shutting down.")
+
+
+if __name__ == "__main__":
+    main()

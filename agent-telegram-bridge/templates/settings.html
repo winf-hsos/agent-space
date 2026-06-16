@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Settings — Agent Manager{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+  <h1 class="text-2xl font-semibold text-slate-100">Settings</h1>
+  <p class="text-slate-500 text-sm mt-1">Global bridge configuration and environment variables.</p>
+</div>
+
+<form method="POST" action="/settings">
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+    <div class="xl:col-span-2 space-y-5">
+
+      <!-- Bridge settings -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-1">Bridge</h2>
+        <p class="text-xs text-slate-500 mb-4">Saved to <code class="text-slate-400">agents.yaml</code>.</p>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5" for="concurrency">Max concurrent agents</label>
+          <div class="flex items-center gap-2">
+            <input id="concurrency" name="concurrency" type="number" min="1" max="8"
+                   value="{{ concurrency }}"
+                   class="w-24 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+            <span class="text-xs text-slate-500">agents at once, across all bots</span>
+          </div>
+          <p class="text-xs text-slate-600 mt-1">Keep at 1–2 on a Raspberry Pi. Higher values allow bots to respond in parallel but use more RAM.</p>
+        </div>
+      </div>
+
+      <!-- Voice transcription -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-1">Voice Transcription</h2>
+        <p class="text-xs text-slate-500 mb-4">Saved to <code class="text-slate-400">.env</code>. Enables transcribing voice messages via OpenAI Whisper.</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5">
+              OpenAI API key
+              {% if env.get('OPENAI_API_KEY') %}
+              <span class="text-green-500">✓ set</span>
+              {% else %}
+              <span class="text-slate-600">not set</span>
+              {% endif %}
+            </label>
+            <input name="openai_api_key" type="password"
+                   placeholder="{% if env.get('OPENAI_API_KEY') %}leave blank to keep existing{% else %}sk-…{% endif %}"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+          </div>
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5">Transcription model</label>
+            <input name="transcribe_model" type="text"
+                   value="{{ env.get('TRANSCRIBE_MODEL', '') }}"
+                   placeholder="whisper-1"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+          </div>
+        </div>
+      </div>
+
+      <!-- OpenCode -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-1">OpenCode</h2>
+        <p class="text-xs text-slate-500 mb-4">Saved to <code class="text-slate-400">.env</code>. Only needed if auto-detection fails (common on Windows).</p>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">
+            OpenCode binary path
+            {% if env.get('OPENCODE_BIN') %}
+            <span class="text-green-500">✓ set: {{ env.OPENCODE_BIN }}</span>
+            {% else %}
+            <span class="text-slate-600">auto-detect</span>
+            {% endif %}
+          </label>
+          <input name="opencode_bin" type="text"
+                 placeholder="C:\Users\you\AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode.exe"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+          <p class="text-xs text-slate-600 mt-1">Point to the .exe (not .cmd) on Windows to avoid multi-line prompt truncation.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Sidebar -->
+    <div class="space-y-5">
+      <div class="flex flex-col gap-2.5">
+        <button type="submit"
+                class="w-full px-4 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold transition-colors">
+          Save Settings
+        </button>
+      </div>
+
+      <!-- .env overview -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h3 class="text-sm font-semibold text-slate-400 mb-3">.env variables</h3>
+        {% if env %}
+        <div class="space-y-2">
+          {% for k, v in env.items() %}
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-mono text-slate-400">{{ k }}</span>
+            <span class="text-xs text-green-500">✓ set</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-xs text-slate-500">.env file not found or empty.</p>
+        {% endif %}
+        <p class="text-xs text-slate-600 mt-3">Values are never displayed. Restart the bridge after making changes.</p>
+      </div>
+
+      <!-- File paths -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <h3 class="text-xs font-semibold text-slate-500 mb-2">Config paths</h3>
+        <div class="space-y-1.5">
+          <div>
+            <p class="text-xs text-slate-600">agents.yaml</p>
+            <p class="text-xs font-mono text-slate-500 break-all">{{ request.url.scheme + '://agents.yaml' }}</p>
+          </div>
+          <div>
+            <p class="text-xs text-slate-600">.env</p>
+            <p class="text-xs font-mono text-slate-500 break-all">{{ request.url.scheme + '//.env' }}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</form>
+{% endblock %}

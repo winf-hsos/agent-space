@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block title %}{% if agent %}Edit {{ agent.name }}{% else %}New Agent{% endif %} — Agent Manager{% endblock %}
+
+{% block content %}
+<!-- Header -->
+<div class="mb-8">
+  <a href="{% if agent %}/agents/{{ agent.name }}{% else %}/{% endif %}"
+     class="inline-flex items-center gap-1 text-sm text-slate-500 hover:text-slate-300 transition-colors mb-3">
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+    </svg>
+    {% if agent %}{{ agent.name }}{% else %}Dashboard{% endif %}
+  </a>
+  <h1 class="text-2xl font-semibold text-slate-100">
+    {% if agent %}Edit Agent{% else %}New Agent{% endif %}
+  </h1>
+  {% if not agent %}
+  <p class="text-slate-500 text-sm mt-1">Configure a new agent backed by an OpenCode model.</p>
+  {% endif %}
+</div>
+
+{% if error %}
+<div class="mb-6 flex items-center gap-3 px-4 py-3 rounded-lg bg-red-950 border border-red-900 text-red-300 text-sm">
+  <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+          d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+  </svg>
+  {{ error }}
+</div>
+{% endif %}
+
+<form method="POST" action="{% if agent %}/agents/{{ agent.name }}/edit{% else %}/agents/new{% endif %}">
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+
+    <!-- Main config -->
+    <div class="xl:col-span-2 space-y-5">
+
+      <!-- Identity -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-4">Identity</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="name">Agent name <span class="text-red-500">*</span></label>
+            <input id="name" name="name" type="text" required
+                   value="{{ agent.name if agent else '' }}"
+                   {% if agent %}readonly{% endif %}
+                   placeholder="wiki"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600
+                          {% if agent %}opacity-60 cursor-not-allowed{% endif %}">
+            <p class="text-xs text-slate-600 mt-1">Used in history filenames and logs. Lowercase, no spaces.</p>
+          </div>
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="model">Model <span class="text-slate-600">(optional)</span></label>
+            <input id="model" name="model" type="text"
+                   value="{{ agent.model if agent and agent.model else '' }}"
+                   placeholder="openai/gpt-4o-mini"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+            <p class="text-xs text-slate-600 mt-1">provider/model format. Leave blank for OpenCode's default.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Token -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-1">Telegram Token</h2>
+        <p class="text-xs text-slate-500 mb-4">The token is stored in <code class="text-slate-400">.env</code>, never in agents.yaml.</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="token_env">Env var name <span class="text-red-500">*</span></label>
+            <input id="token_env" name="token_env" type="text" required
+                   value="{{ agent.token_env if agent else '' }}"
+                   placeholder="EXAMPLE_BOT_TOKEN"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+            <p class="text-xs text-slate-600 mt-1">Name of the variable in .env that holds the token.</p>
+          </div>
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="token_value">
+              Token value
+              {% if agent and env.get(agent.token_env) %}
+              <span class="text-green-500 ml-1">✓ already set</span>
+              {% elif agent %}
+              <span class="text-red-500 ml-1">✗ missing</span>
+              {% endif %}
+            </label>
+            <input id="token_value" name="token_value" type="password"
+                   placeholder="{% if agent and env.get(agent.token_env) %}leave blank to keep existing{% else %}123456:ABC-your-token{% endif %}"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+            <p class="text-xs text-slate-600 mt-1">Get from @BotFather on Telegram. Leave blank to keep the current value.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Access -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-1">Access Control</h2>
+        <p class="text-xs text-slate-500 mb-4">Only listed chat IDs can interact with this agent. The bridge refuses to start with an empty list.</p>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5" for="allowed_ids">Allowed Telegram chat IDs <span class="text-red-500">*</span></label>
+          <input id="allowed_ids" name="allowed_ids" type="text" required
+                 value="{{ agent.allowed_ids | join(', ') if agent else '' }}"
+                 placeholder="8941055223, -1001234567890"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+          <p class="text-xs text-slate-600 mt-1">Comma-separated. Use negative IDs for group chats. Find yours by messaging the agent then opening api.telegram.org/bot&lt;TOKEN&gt;/getUpdates.</p>
+        </div>
+      </div>
+
+      <!-- Workdir -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-1">Workdir</h2>
+        <p class="text-xs text-slate-500 mb-4">The agent's working directory. Must be <strong class="text-slate-400">outside</strong> the bridge folder for security (agents have shell access).</p>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5" for="workdir">Path <span class="text-red-500">*</span></label>
+          <input id="workdir" name="workdir" type="text" required
+                 value="{{ agent.workdir if agent else '' }}"
+                 placeholder="/home/pi/agent-space/agents/my-agent"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+          <p class="text-xs text-slate-600 mt-1">The directory will be created if it doesn't exist. Put AGENTS.md here to define the agent's personality.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Options sidebar -->
+    <div class="space-y-5">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 mb-4">Behaviour</h2>
+        <div class="space-y-4">
+
+          <div>
+            <label class="text-xs text-slate-500 block mb-2">Session memory</label>
+            <div class="flex items-center gap-4">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="bot_continue" value="false"
+                       {% if not agent or not agent.get('continue') %}checked{% endif %}
+                       class="accent-indigo-500">
+                <span class="text-sm text-slate-300">Stateless</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="bot_continue" value="true"
+                       {% if agent and agent.get('continue') %}checked{% endif %}
+                       class="accent-indigo-500">
+                <span class="text-sm text-slate-300">Continue session</span>
+              </label>
+            </div>
+            <p class="text-xs text-slate-600 mt-1.5">Stateless: agent recalls via its files. Continue: OpenCode keeps the conversation in memory.</p>
+          </div>
+
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="history">History replay</label>
+            <div class="flex items-center gap-2">
+              <input id="history" name="history" type="number" min="0" max="200"
+                     value="{{ agent.history if agent else 0 }}"
+                     class="w-24 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+              <span class="text-xs text-slate-500">messages</span>
+            </div>
+            <p class="text-xs text-slate-600 mt-1">Prepend last N messages as context. 0 = off.</p>
+          </div>
+
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="timeout">Timeout</label>
+            <div class="flex items-center gap-2">
+              <input id="timeout" name="timeout" type="number" min="30" max="3600"
+                     value="{{ agent.timeout if agent else 600 }}"
+                     class="w-24 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+              <span class="text-xs text-slate-500">seconds</span>
+            </div>
+            <p class="text-xs text-slate-600 mt-1">Max time the agent may work on a single message.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="flex flex-col gap-2.5">
+        <button type="submit"
+                class="w-full px-4 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold transition-colors">
+          {% if agent %}Save Changes{% else %}Create Agent{% endif %}
+        </button>
+        <a href="{% if agent %}/agents/{{ agent.name }}{% else %}/{% endif %}"
+           class="w-full text-center px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium transition-colors">
+          Cancel
+        </a>
+      </div>
+
+      {% if not agent %}
+      <!-- Quickstart hint -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <h3 class="text-xs font-semibold text-slate-400 mb-2">Quickstart</h3>
+        <ol class="text-xs text-slate-500 space-y-1.5 list-decimal list-inside">
+          <li>Create a Telegram bot via @BotFather</li>
+          <li>Paste the token into the Token Value field</li>
+          <li>Message the bot once, then get your chat ID from getUpdates</li>
+          <li>Set a workdir path and optionally add an AGENTS.md there</li>
+          <li>Save, then start the bridge from the sidebar</li>
+        </ol>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</form>
+{% endblock %}

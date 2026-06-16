@@ -1,0 +1,29 @@
+# systemd unit for running the multi-bot bridge on a Raspberry Pi (Linux).
+#
+# Install:
+#   1. Copy the project to e.g. /home/pi/telegram-agents
+#   2. python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   3. Adjust the paths/User below, then:
+#        sudo cp telegram-agents.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now telegram-agents
+#   4. Logs:  journalctl -u telegram-agents -f
+
+[Unit]
+Description=Telegram -> OpenCode multi-bot bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/telegram-agents
+EnvironmentFile=/home/pi/telegram-agents/.env
+# Ensure the opencode binary is on PATH for this service user:
+Environment=PATH=/home/pi/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/pi/telegram-agents/.venv/bin/python /home/pi/telegram-agents/telegram_agent.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

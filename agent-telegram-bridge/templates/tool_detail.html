@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}{% if tool %}{{ tool.name }} — Tools{% else %}New Tool{% endif %} — Agent Manager{% endblock %}
+
+{% block content %}
+<!-- Breadcrumb -->
+<nav class="flex items-center gap-2 text-sm text-slate-500 mb-6">
+  <a href="/tools" class="hover:text-slate-300 transition-colors">Tools</a>
+  {% if tool %}
+  <svg class="w-3.5 h-3.5 text-slate-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+  </svg>
+  <span class="text-slate-300 font-mono">{{ tool.name }}</span>
+  {% endif %}
+</nav>
+
+{% if not tool %}
+<p class="text-slate-400">Use the button on the Tools page to create a new tool.</p>
+{% else %}
+
+<div class="flex items-start justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-semibold text-slate-100 font-mono">{{ tool.name }}</h1>
+    <p class="text-xs text-slate-600 mt-1 font-mono">{{ tool.path }}</p>
+  </div>
+  <button onclick="confirmDeleteTool('{{ tool.name }}')"
+          class="text-sm px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-400 font-medium transition-colors">
+    Delete Tool
+  </button>
+</div>
+
+<div class="flex gap-5" style="min-height: 600px;">
+
+  <!-- File sidebar -->
+  <div class="w-52 shrink-0 flex flex-col gap-3">
+    <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden flex-1">
+      <div class="px-3 py-2.5 border-b border-slate-800">
+        <p class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Files</p>
+      </div>
+      <div class="py-1">
+        {% for f in files %}
+        <a href="/tools/{{ tool.name }}?file={{ f }}"
+           class="flex items-center gap-2 px-3 py-2 text-xs font-mono transition-colors
+                  {% if f == active_file %}bg-slate-800 text-slate-100{% else %}text-slate-400 hover:bg-slate-800/50 hover:text-slate-300{% endif %}">
+          <svg class="w-3 h-3 shrink-0 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          <span class="truncate">{{ f }}</span>
+          {% if f == active_file %}
+          <button type="button"
+                  onclick="event.preventDefault(); deleteFile('{{ tool.name }}', '{{ f }}')"
+                  class="ml-auto text-slate-600 hover:text-red-400 transition-colors shrink-0"
+                  title="Delete file">✕</button>
+          {% endif %}
+        </a>
+        {% endfor %}
+        {% if not files %}
+        <p class="px-3 py-2 text-xs text-slate-600 italic">No files yet</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Add file -->
+    <form method="POST" action="/tools/{{ tool.name }}/new-file" class="flex gap-1.5">
+      <input name="filename" type="text" required placeholder="new-file.py"
+             class="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+      <button type="submit"
+              class="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors shrink-0"
+              title="Add file">+</button>
+    </form>
+  </div>
+
+  <!-- Editor -->
+  <div class="flex-1 min-w-0">
+    {% if active_file %}
+    <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden h-full flex flex-col">
+      <div class="flex items-center justify-between px-4 py-2.5 border-b border-slate-800 shrink-0">
+        <span class="text-xs font-mono text-slate-400">{{ active_file }}</span>
+        {% if not is_text %}
+        <span class="text-xs text-amber-400">Binary file — not editable</span>
+        {% endif %}
+      </div>
+      {% if is_text %}
+      <form method="POST" action="/tools/{{ tool.name }}/save" class="flex flex-col flex-1">
+        <input type="hidden" name="filename" value="{{ active_file }}">
+        <textarea name="content" spellcheck="false"
+                  class="flex-1 w-full bg-transparent px-4 py-3 text-sm font-mono text-slate-200 focus:outline-none resize-none"
+                  style="min-height: 520px;">{{ file_content }}</textarea>
+        <div class="px-4 py-3 border-t border-slate-800 flex items-center gap-3 shrink-0">
+          <button type="submit"
+                  class="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+            Save
+          </button>
+          <span class="text-xs text-slate-600">Ctrl+S doesn't submit — use the button</span>
+        </div>
+      </form>
+      {% else %}
+      <div class="flex-1 flex items-center justify-center text-slate-600 text-sm">Binary file cannot be edited here.</div>
+      {% endif %}
+    </div>
+    {% else %}
+    <div class="bg-slate-900 border border-slate-800 rounded-xl h-full flex items-center justify-center text-slate-600 text-sm">
+      Select a file to edit, or add one using the + button.
+    </div>
+    {% endif %}
+  </div>
+
+</div>
+
+<!-- Delete form (hidden) -->
+<form id="delete-tool-form" method="POST" action="" style="display:none"></form>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+function confirmDeleteTool(name) {
+  if (!confirm('Delete tool "' + name + '" and all its files? This cannot be undone.')) return;
+  const f = document.getElementById('delete-tool-form');
+  f.action = '/tools/' + name + '/delete';
+  f.submit();
+}
+async function deleteFile(toolName, filename) {
+  if (!confirm('Delete "' + filename + '"?')) return;
+  const r = await fetch('/api/tools/' + toolName + '/files/' + encodeURIComponent(filename), { method: 'DELETE' });
+  if ((await r.json()).ok) window.location.href = '/tools/' + toolName;
+}
+{% endblock %}

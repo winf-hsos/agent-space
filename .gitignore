@@ -1,0 +1,39 @@
+# ── Secrets ────────────────────────────────────────────────────────────────────
+.env
+
+# ── Machine-specific config (paths differ per machine) ────────────────────────
+agent-telegram-bridge/agents.yaml
+
+# ── Runtime data (not source code) ───────────────────────────────────────────
+agent-telegram-bridge/history/
+agents/*/reminders/
+agents/*/inbox/
+
+# ── Personal agents (only example-agent is tracked) ──────────────────────────
+agents/*/
+!agents/example-agent/
+!agents/example-agent/**
+
+# ── OpenCode session state (machine-specific) ─────────────────────────────────
+**/opencode.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.python-env/
+*.egg-info/
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+CLAUDE.md
+
+# ── Obsidian ──────────────────────────────────────────────────────────────────
+.obsidian/
+.trash/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

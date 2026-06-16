@@ -1,0 +1,8 @@
+﻿#!/bin/sh
+# POSIX shim (Raspberry Pi / Linux / a bash-like shell on Windows) so agents can
+# call `remind ...`. Prefer python3, fall back to python.
+dir=$(dirname "$0")
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 "$dir/remind.py" "$@"
+fi
+exec python "$dir/remind.py" "$@"

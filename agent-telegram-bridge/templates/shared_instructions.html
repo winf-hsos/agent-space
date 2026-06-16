@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Shared Instructions — Agent Manager{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+  <h1 class="text-2xl font-semibold text-slate-100">Shared Instructions</h1>
+  <p class="text-slate-500 text-sm mt-1">
+    Common Telegram mechanics inherited by every agent.
+    Saved to <code class="text-slate-400 font-mono text-xs">agent-tools/shared/agents-common.md</code>.
+  </p>
+</div>
+
+<form method="POST" action="/shared-instructions">
+  <div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
+
+    <!-- Editor -->
+    <div class="xl:col-span-3">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div class="flex items-center justify-between px-4 py-2.5 border-b border-slate-800">
+          <span class="text-xs font-medium text-slate-400 font-mono">agents-common.md</span>
+          {% if not exists %}
+          <span class="text-xs px-2 py-0.5 rounded-full bg-amber-950 text-amber-400">file not found — will be created on save</span>
+          {% else %}
+          <span class="text-xs text-slate-600">{{ path }}</span>
+          {% endif %}
+        </div>
+        <textarea name="content" rows="36" spellcheck="false"
+                  class="w-full bg-transparent px-4 py-3 text-sm font-mono text-slate-200 focus:outline-none placeholder-slate-600"
+                  placeholder="Write shared instructions here. All agents inherit this file automatically.">{{ content }}</textarea>
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="space-y-4">
+      <button type="submit"
+              class="w-full px-4 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold transition-colors">
+        Save
+      </button>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+        <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wide">What goes here</h3>
+        <div class="space-y-2 text-xs text-slate-500 leading-relaxed">
+          <p>Rules shared by <strong class="text-slate-400">all agents</strong> — Telegram message formatting, the <code class="text-slate-400">[[send: path]]</code> file-send marker, reminder invocation, and proactive cron behaviour.</p>
+          <p>Each agent's <code class="text-slate-400">AGENTS.md</code> defines only that agent's role. OpenCode concatenates both files automatically.</p>
+          <p class="text-slate-600">Do not duplicate rules from here inside individual agent files.</p>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2">
+        <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Per-agent instructions</h3>
+        <p class="text-xs text-slate-500">Edit each agent's personality file from the bot detail page → <span class="text-slate-400">Instructions</span> tab.</p>
+      </div>
+    </div>
+
+  </div>
+</form>
+{% endblock %}

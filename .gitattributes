@@ -1,0 +1,3 @@
+# Ensure shell scripts keep Unix line endings and executable bit
+agent-tools/remind/remind   text eol=lf
+agent-tools/*/             text eol=lf

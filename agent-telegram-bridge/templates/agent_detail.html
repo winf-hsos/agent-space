@@ -1,0 +1,443 @@
+{% extends "base.html" %}
+{% block title %}{{ agent.name }} — Agent Manager{% endblock %}
+
+{% block content %}
+<!-- Header -->
+<div class="mb-6">
+  <a href="/" class="inline-flex items-center gap-1 text-sm text-slate-500 hover:text-slate-300 transition-colors mb-3">
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+    </svg>
+    Dashboard
+  </a>
+  <div class="flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <h1 class="text-2xl font-semibold text-slate-100">{{ agent.name }}</h1>
+      {% if agent.model %}
+      <span class="text-sm px-2.5 py-1 rounded-full bg-slate-800 text-slate-400 font-mono">{{ agent.model }}</span>
+      {% endif %}
+      {% if agent.get('continue') %}
+      <span class="text-xs px-2 py-1 rounded-full bg-indigo-950 text-indigo-400">session memory</span>
+      {% endif %}
+    </div>
+    <div class="flex items-center gap-2">
+      <a href="/agents/{{ agent.name }}/edit"
+         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+        </svg>
+        Edit
+      </a>
+      <button onclick="confirmDelete()"
+              class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-400 text-sm font-medium transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+        </svg>
+        Delete
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Tab bar -->
+<div class="border-b border-slate-800 mb-6">
+  <nav class="flex gap-0 -mb-px">
+    {% for t, label in [('overview','Overview'),('history','History'),('reminders','Reminders'),('instructions','Instructions'),('schedules','Schedules')] %}
+    <a href="/agents/{{ agent.name }}?tab={{ t }}"
+       class="px-4 py-3 text-sm font-medium transition-colors whitespace-nowrap
+              {% if tab == t %}tab-active{% else %}tab-inactive{% endif %}">
+      {{ label }}
+      {% if t == 'reminders' and reminders %}
+      <span class="ml-1.5 text-xs px-1.5 py-0.5 rounded-full bg-amber-950 text-amber-400">{{ reminders|length }}</span>
+      {% endif %}
+    </a>
+    {% endfor %}
+  </nav>
+</div>
+
+<!-- ═══════════════════════ OVERVIEW ═══════════════════════ -->
+{% if tab == 'overview' %}
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <!-- Config summary -->
+  <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+    <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide mb-4">Configuration</h3>
+    <dl class="space-y-3">
+      <div>
+        <dt class="text-xs text-slate-500 mb-0.5">Token env var</dt>
+        <dd class="text-sm font-mono text-slate-300">{{ agent.token_env }}
+          {% if env.get(agent.token_env) %}
+          <span class="ml-1 text-green-500 text-xs">✓ set</span>
+          {% else %}
+          <span class="ml-1 text-red-500 text-xs">✗ missing</span>
+          {% endif %}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-xs text-slate-500 mb-0.5">Allowed IDs</dt>
+        <dd class="text-sm font-mono text-slate-300">{{ agent.allowed_ids | join(', ') }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-slate-500 mb-0.5">Workdir</dt>
+        <dd class="text-xs font-mono text-slate-400 break-all">{{ agent.workdir }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-slate-500 mb-0.5">Session mode</dt>
+        <dd class="text-sm text-slate-300">{{ 'continue (stateful)' if agent.get('continue') else 'stateless' }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-slate-500 mb-0.5">History replay</dt>
+        <dd class="text-sm text-slate-300">{{ agent.history or 0 }} messages</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-slate-500 mb-0.5">Timeout</dt>
+        <dd class="text-sm text-slate-300">{{ agent.timeout or 600 }}s</dd>
+      </div>
+    </dl>
+  </div>
+
+  <!-- Stats -->
+  <div class="space-y-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+      <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide mb-4">Activity</h3>
+      <div class="space-y-3">
+        {% for chat in chats[:5] %}
+        <a href="/agents/{{ agent.name }}?tab=history&chat_id={{ chat.chat_id }}"
+           class="flex items-center justify-between hover:bg-slate-800 -mx-2 px-2 py-1.5 rounded-lg transition-colors group">
+          <div>
+            <p class="text-sm font-mono text-slate-300 group-hover:text-slate-100">{{ chat.chat_id }}</p>
+            <p class="text-xs text-slate-500">{{ chat.count }} messages</p>
+          </div>
+          <span class="text-xs text-slate-500">{{ chat.last_t | fmt_rel }}</span>
+        </a>
+        {% else %}
+        <p class="text-sm text-slate-500">No conversation history yet.</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    {% if reminders %}
+    <div class="bg-amber-950/30 border border-amber-900/50 rounded-xl p-5">
+      <h3 class="text-sm font-semibold text-amber-400 mb-3">Pending Reminders ({{ reminders|length }})</h3>
+      <div class="space-y-2">
+        {% for r in reminders[:3] %}
+        <div class="text-sm">
+          <span class="text-amber-300">{{ r.due[:16].replace('T',' ') }}</span>
+          <span class="text-slate-400 ml-1">— {{ r.text[:60] }}{% if r.text|length > 60 %}…{% endif %}</span>
+        </div>
+        {% endfor %}
+        {% if reminders|length > 3 %}
+        <a href="/agents/{{ agent.name }}?tab=reminders" class="text-xs text-amber-500 hover:text-amber-300">
+          +{{ reminders|length - 3 }} more →
+        </a>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Schedules -->
+  <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+    <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide mb-4">Schedules</h3>
+    {% if agent.get('schedules') %}
+    <div class="space-y-3">
+      {% for s in agent.schedules %}
+      <div class="border border-slate-700 rounded-lg p-3">
+        <p class="text-xs font-mono text-indigo-400 mb-1">{{ s.cron }}</p>
+        <p class="text-sm text-slate-300">{{ s.prompt[:80] }}{% if s.prompt|length > 80 %}…{% endif %}</p>
+        {% if s.get('chat_id') %}
+        <p class="text-xs text-slate-500 mt-1">→ chat {{ s.chat_id }}</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-sm text-slate-500">No cron schedules.</p>
+    <a href="/agents/{{ agent.name }}?tab=schedules" class="text-xs text-indigo-400 hover:text-indigo-300 mt-2 inline-block">Add a schedule →</a>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══════════════════════ HISTORY ═══════════════════════ -->
+{% elif tab == 'history' %}
+{% if not chats %}
+<div class="flex flex-col items-center py-16 text-center">
+  <span class="text-4xl mb-3">💬</span>
+  <p class="text-slate-400">No conversation history yet.</p>
+  <p class="text-sm text-slate-600 mt-1">History is recorded when the bridge runs and the agent receives messages.</p>
+</div>
+{% else %}
+<div class="flex gap-4 h-[calc(100vh-240px)] min-h-80">
+  <!-- Chat list sidebar -->
+  <div class="w-56 shrink-0 bg-slate-900 border border-slate-800 rounded-xl overflow-y-auto scrollbar-thin">
+    {% for chat in chats %}
+    <button onclick="loadChat('{{ chat.chat_id }}')"
+            id="chat-btn-{{ chat.chat_id }}"
+            class="w-full text-left px-4 py-3 border-b border-slate-800 hover:bg-slate-800 transition-colors
+                   {% if chat.chat_id == chat_id %}bg-slate-800{% endif %}">
+      <p class="text-sm font-mono font-medium text-slate-200">{{ chat.chat_id }}</p>
+      <p class="text-xs text-slate-500 mt-0.5">{{ chat.count }} msgs · {{ chat.last_t | fmt_rel }}</p>
+    </button>
+    {% endfor %}
+  </div>
+
+  <!-- Message panel -->
+  <div class="flex-1 bg-slate-900 border border-slate-800 rounded-xl flex flex-col overflow-hidden">
+    <div id="msg-header" class="px-4 py-3 border-b border-slate-800 shrink-0">
+      <p class="text-sm font-semibold text-slate-300" id="msg-chat-id">
+        {% if chat_id %}Chat {{ chat_id }}{% else %}Select a chat{% endif %}
+      </p>
+    </div>
+    <div id="msg-list" class="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3">
+      {% if history_entries %}
+        {% for e in history_entries %}
+        <div class="flex {% if e.role == 'user' %}justify-start{% else %}justify-end{% endif %}">
+          <div class="max-w-[78%] rounded-2xl px-4 py-2.5 text-sm
+                      {% if e.role == 'user' %}bg-slate-800 text-slate-200 rounded-tl-sm{% else %}bg-indigo-900 text-indigo-100 rounded-tr-sm{% endif %}">
+            <p class="text-xs opacity-50 mb-1">{{ 'You' if e.role == 'user' else 'Agent' }} · {{ e.t | fmt_ts }}</p>
+            <p class="whitespace-pre-wrap leading-relaxed">{{ e.text }}</p>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+      <p class="text-slate-500 text-sm text-center mt-8">Select a chat to view messages.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+
+<!-- ═══════════════════════ REMINDERS ═══════════════════════ -->
+{% elif tab == 'reminders' %}
+<div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+  {% if not reminders %}
+  <div class="flex flex-col items-center py-16 text-center">
+    <span class="text-4xl mb-3">🔔</span>
+    <p class="text-slate-400">No pending reminders.</p>
+  </div>
+  {% else %}
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-slate-800">
+        <th class="text-left px-5 py-3 text-xs text-slate-500 font-medium uppercase tracking-wide">Due</th>
+        <th class="text-left px-5 py-3 text-xs text-slate-500 font-medium uppercase tracking-wide">Message</th>
+        <th class="text-left px-5 py-3 text-xs text-slate-500 font-medium uppercase tracking-wide">Chat ID</th>
+        <th class="px-5 py-3"></th>
+      </tr>
+    </thead>
+    <tbody id="reminder-table">
+      {% for r in reminders %}
+      <tr class="border-b border-slate-800/60 hover:bg-slate-800/40" id="rem-{{ loop.index0 }}">
+        <td class="px-5 py-3 font-mono text-amber-400 whitespace-nowrap">{{ r.due[:16].replace('T', ' ') }}</td>
+        <td class="px-5 py-3 text-slate-300">{{ r.text }}</td>
+        <td class="px-5 py-3 font-mono text-slate-500">{{ r.get('chat_id', '—') }}</td>
+        <td class="px-5 py-3 text-right">
+          <button onclick="deleteReminder('{{ r._file }}', {{ loop.index0 }})"
+                  class="text-xs px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-400 transition-colors">
+            Delete
+          </button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════ INSTRUCTIONS ═══════════════════════ -->
+{% elif tab == 'instructions' %}
+<div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+  <div class="xl:col-span-2">
+    <form method="POST" action="/agents/{{ agent.name }}/agents-md">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-slate-800">
+          <div>
+            <p class="text-sm font-medium text-slate-200">AGENTS.md</p>
+            <p class="text-xs text-slate-500 font-mono mt-0.5">{{ agent.workdir }}/AGENTS.md</p>
+          </div>
+          <button type="submit"
+                  class="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+            Save
+          </button>
+        </div>
+        <textarea name="content" rows="28"
+                  class="w-full bg-slate-900 text-slate-200 font-mono text-sm px-5 py-4 focus:outline-none leading-relaxed">{{ agents_md }}</textarea>
+      </div>
+    </form>
+  </div>
+  <div class="space-y-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+      <h3 class="text-sm font-semibold text-slate-400 mb-3">About AGENTS.md</h3>
+      <p class="text-xs text-slate-500 leading-relaxed">
+        This file defines the agent's personality, domain knowledge, and specialised behaviour.
+        Keep it focused on the agent's role — the shared Telegram mechanics are inherited
+        from <code class="text-slate-400">agents-common.md</code> automatically.
+      </p>
+    </div>
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+      <h3 class="text-sm font-semibold text-slate-400 mb-3">Shared instructions</h3>
+      <p class="text-xs text-slate-500 leading-relaxed mb-2">
+        All agents inherit the common Telegram rules via <code class="text-slate-400">opencode.json</code>. Do not duplicate those rules here.
+      </p>
+      <p class="text-xs text-slate-600">Plain text only · no Markdown in replies · max 4096 chars · use [[send: path]] for files · use <code>remind</code> for reminders</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════ SCHEDULES ═══════════════════════ -->
+{% elif tab == 'schedules' %}
+<div class="space-y-6">
+  <!-- Existing schedules -->
+  <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-800">
+      <h3 class="text-sm font-semibold text-slate-300">Cron Schedules</h3>
+      <p class="text-xs text-slate-500 mt-0.5">Proactive agent runs at fixed times. Requires <code class="text-slate-400">pip install croniter</code>.</p>
+    </div>
+    {% if agent.get('schedules') %}
+    <table class="w-full text-sm" id="sched-table">
+      <thead>
+        <tr class="border-b border-slate-800">
+          <th class="text-left px-5 py-3 text-xs text-slate-500 font-medium uppercase tracking-wide">Cron</th>
+          <th class="text-left px-5 py-3 text-xs text-slate-500 font-medium uppercase tracking-wide">Prompt</th>
+          <th class="text-left px-5 py-3 text-xs text-slate-500 font-medium uppercase tracking-wide">Chat ID</th>
+          <th class="px-5 py-3"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in agent.schedules %}
+        <tr class="border-b border-slate-800/60 hover:bg-slate-800/40" id="sched-row-{{ loop.index0 }}">
+          <td class="px-5 py-3 font-mono text-indigo-400 whitespace-nowrap">{{ s.cron }}</td>
+          <td class="px-5 py-3 text-slate-300">{{ s.prompt[:100] }}{% if s.prompt|length > 100 %}…{% endif %}</td>
+          <td class="px-5 py-3 font-mono text-slate-500">{{ s.get('chat_id', '—') }}</td>
+          <td class="px-5 py-3 text-right">
+            <button onclick="deleteSchedule({{ loop.index0 }})"
+                    class="text-xs px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-400 transition-colors">
+              Delete
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="px-5 py-8 text-center">
+      <p class="text-slate-500 text-sm">No schedules configured.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Add schedule form -->
+  <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+    <h3 class="text-sm font-semibold text-slate-300 mb-4">Add Schedule</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div>
+        <label class="text-xs text-slate-500 block mb-1.5">Cron expression</label>
+        <input id="new-cron" type="text" placeholder="0 8 * * *"
+               class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+        <p class="text-xs text-slate-600 mt-1">min hour day month weekday (local time)</p>
+      </div>
+      <div>
+        <label class="text-xs text-slate-500 block mb-1.5">Chat ID override <span class="text-slate-600">(optional)</span></label>
+        <input id="new-chat-id" type="text" placeholder="defaults to first allowed_id"
+               class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+      </div>
+      <div class="md:col-span-2">
+        <label class="text-xs text-slate-500 block mb-1.5">Prompt</label>
+        <textarea id="new-prompt" rows="3" placeholder="Summarise anything new since yesterday..."
+                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600 leading-relaxed"></textarea>
+      </div>
+    </div>
+    <div class="flex justify-end mt-4">
+      <button onclick="addSchedule()"
+              class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+        Add Schedule
+      </button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Hidden delete form -->
+<form id="delete-agent-form" method="POST" action="/agents/{{ agent.name }}/delete" style="display:none"></form>
+{% endblock %}
+
+
+{% block scripts %}
+const AGENT_NAME = '{{ agent.name }}';
+const SELECTED_CHAT = '{{ chat_id }}';
+
+// Auto-scroll history
+window.addEventListener('DOMContentLoaded', () => {
+  const ml = document.getElementById('msg-list');
+  if (ml) ml.scrollTop = ml.scrollHeight;
+});
+
+// Load a chat's messages without page reload
+async function loadChat(chatId) {
+  document.querySelectorAll('[id^="chat-btn-"]').forEach(b => b.classList.remove('bg-slate-800'));
+  const btn = document.getElementById('chat-btn-' + chatId);
+  if (btn) btn.classList.add('bg-slate-800');
+
+  document.getElementById('msg-chat-id').textContent = 'Chat ' + chatId;
+  const ml = document.getElementById('msg-list');
+  ml.innerHTML = '<p class="text-slate-500 text-sm text-center mt-8">Loading…</p>';
+
+  const r = await fetch('/api/agents/' + AGENT_NAME + '/history/' + chatId);
+  const d = await r.json();
+  if (!d.entries || !d.entries.length) {
+    ml.innerHTML = '<p class="text-slate-500 text-sm text-center mt-8">No messages in this chat.</p>';
+    return;
+  }
+  ml.innerHTML = d.entries.map(e => {
+    const isUser = e.role === 'user';
+    const dt = new Date(e.t * 1000).toLocaleString(undefined, {dateStyle:'short', timeStyle:'short'});
+    const text = e.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return `<div class="flex ${isUser ? 'justify-start' : 'justify-end'}">
+      <div class="max-w-[78%] rounded-2xl px-4 py-2.5 text-sm
+                  ${isUser ? 'bg-slate-800 text-slate-200 rounded-tl-sm' : 'bg-indigo-900 text-indigo-100 rounded-tr-sm'}">
+        <p class="text-xs opacity-50 mb-1">${isUser ? 'You' : 'Agent'} · ${dt}</p>
+        <p class="whitespace-pre-wrap leading-relaxed">${text}</p>
+      </div>
+    </div>`;
+  }).join('');
+  ml.scrollTop = ml.scrollHeight;
+}
+
+async function deleteReminder(filename, idx) {
+  if (!confirm('Delete this reminder?')) return;
+  await fetch('/api/agents/' + AGENT_NAME + '/reminders/' + encodeURIComponent(filename), { method: 'DELETE' });
+  const row = document.getElementById('rem-' + idx);
+  if (row) row.remove();
+}
+
+async function deleteSchedule(idx) {
+  if (!confirm('Delete this schedule?')) return;
+  await fetch('/api/agents/' + AGENT_NAME + '/schedules/' + idx, { method: 'DELETE' });
+  const row = document.getElementById('sched-row-' + idx);
+  if (row) row.remove();
+}
+
+async function addSchedule() {
+  const cron   = document.getElementById('new-cron').value.trim();
+  const prompt = document.getElementById('new-prompt').value.trim();
+  const chatId = document.getElementById('new-chat-id').value.trim();
+  if (!cron || !prompt) { alert('Cron expression and prompt are required.'); return; }
+  await fetch('/api/agents/' + AGENT_NAME + '/schedules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cron, prompt, chat_id: chatId || null }),
+  });
+  location.reload();
+}
+
+function confirmDelete() {
+  if (confirm('Delete agent "' + AGENT_NAME + '"? This cannot be undone.')) {
+    document.getElementById('delete-agent-form').submit();
+  }
+}
+{% endblock %}

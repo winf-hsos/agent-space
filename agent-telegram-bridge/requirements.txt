@@ -1,0 +1,10 @@
+requests
+python-dotenv
+pyyaml
+croniter       # only needed for cron `schedules` in bots.yaml
+
+# Web UI
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart   # required for FastAPI form parsing

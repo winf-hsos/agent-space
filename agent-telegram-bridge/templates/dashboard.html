@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Agent Manager{% endblock %}
+
+{% block content %}
+<!-- Header -->
+<div class="flex items-center justify-between mb-8">
+  <div>
+    <h1 class="text-2xl font-semibold text-slate-100">Dashboard</h1>
+    <p class="text-sm text-slate-500 mt-0.5">{{ agents|length }} agent{{ 's' if agents|length != 1 }} · concurrency {{ concurrency }}</p>
+  </div>
+  <a href="/agents/new"
+     class="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+    </svg>
+    New Agent
+  </a>
+</div>
+
+{% if not agents %}
+<!-- Empty state -->
+<div class="flex flex-col items-center justify-center py-24 text-center">
+  <div class="w-16 h-16 rounded-2xl bg-slate-800 flex items-center justify-center mb-4">
+    <span class="text-3xl">🤖</span>
+  </div>
+  <h2 class="text-lg font-medium text-slate-300 mb-1">No agents configured</h2>
+  <p class="text-slate-500 text-sm mb-6">Add your first agent to get started.</p>
+  <a href="/agents/new" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">
+    Create an agent
+  </a>
+</div>
+{% else %}
+<!-- Agent grid -->
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+  {% for agent in agents %}
+  <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden hover:border-slate-700 transition-colors group">
+    <!-- Card top accent -->
+    <div class="h-1 bg-gradient-to-r from-indigo-600 to-indigo-400"></div>
+
+    <div class="p-5">
+      <!-- Name + model -->
+      <div class="flex items-start justify-between mb-3">
+        <div>
+          <h2 class="text-base font-semibold text-slate-100 leading-tight">{{ agent.name }}</h2>
+          {% if agent.model %}
+          <span class="inline-block mt-1 text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-mono">{{ agent.model }}</span>
+          {% else %}
+          <span class="inline-block mt-1 text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-500">default model</span>
+          {% endif %}
+        </div>
+        {% if agent.reminder_count %}
+        <span class="flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-amber-950 text-amber-400 font-medium shrink-0">
+          <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+            <path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zM10 18a3 3 0 01-3-3h6a3 3 0 01-3 3z"/>
+          </svg>
+          {{ agent.reminder_count }}
+        </span>
+        {% endif %}
+      </div>
+
+      <!-- Stats -->
+      <div class="grid grid-cols-3 gap-2 mb-4">
+        <div class="bg-slate-800/60 rounded-lg px-3 py-2 text-center">
+          <p class="text-lg font-semibold text-slate-200">{{ agent.chat_count }}</p>
+          <p class="text-xs text-slate-500">chats</p>
+        </div>
+        <div class="bg-slate-800/60 rounded-lg px-3 py-2 text-center">
+          <p class="text-lg font-semibold text-slate-200">{{ agent.msg_count }}</p>
+          <p class="text-xs text-slate-500">messages</p>
+        </div>
+        <div class="bg-slate-800/60 rounded-lg px-3 py-2 text-center">
+          <p class="text-sm font-semibold text-slate-200 leading-tight">{{ agent.last_t | fmt_rel }}</p>
+          <p class="text-xs text-slate-500">last active</p>
+        </div>
+      </div>
+
+      <!-- Meta badges -->
+      <div class="flex flex-wrap gap-1.5 mb-4">
+        {% if agent.get('continue') %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-indigo-950 text-indigo-400">session memory</span>
+        {% else %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-500">stateless</span>
+        {% endif %}
+        {% if agent.history %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-500">history {{ agent.history }}</span>
+        {% endif %}
+        {% if agent.get('schedules') %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-500">{{ agent.schedules|length }} schedule{{ 's' if agent.schedules|length != 1 }}</span>
+        {% endif %}
+      </div>
+
+      <!-- Actions -->
+      <div class="flex items-center gap-2">
+        <a href="/agents/{{ agent.name }}"
+           class="flex-1 text-center text-sm px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium transition-colors">
+          View
+        </a>
+        <a href="/agents/{{ agent.name }}/edit"
+           class="text-sm px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium transition-colors">
+          Edit
+        </a>
+        <button onclick="confirmDeleteAgent('{{ agent.name }}')"
+                class="text-sm px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-400 font-medium transition-colors">
+          Delete
+        </button>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Delete form (hidden) -->
+<form id="delete-form" method="POST" action="" style="display:none"></form>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+function confirmDeleteAgent(name) {
+  if (!confirm('Delete agent "' + name + '"? This cannot be undone.')) return;
+  const f = document.getElementById('delete-form');
+  f.action = '/agents/' + name + '/delete';
+  f.submit();
+}
+{% endblock %}
