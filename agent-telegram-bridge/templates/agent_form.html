@@ -108,13 +108,25 @@
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
         <h2 class="text-sm font-semibold text-slate-300 mb-1">Workdir</h2>
         <p class="text-xs text-slate-500 mb-4">The agent's working directory. Must be <strong class="text-slate-400">outside</strong> the bridge folder for security (agents have shell access).</p>
-        <div>
-          <label class="text-xs text-slate-500 block mb-1.5" for="workdir">Path <span class="text-red-500">*</span></label>
-          <input id="workdir" name="workdir" type="text" required
-                 value="{{ agent.workdir if agent else '' }}"
-                 placeholder="/home/pi/agent-space/agents/my-agent"
-                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
-          <p class="text-xs text-slate-600 mt-1">The directory will be created if it doesn't exist. Put AGENTS.md here to define the agent's personality.</p>
+        <div class="space-y-3">
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5" for="workdir">Path <span class="text-red-500">*</span></label>
+            <input id="workdir" name="workdir" type="text" required
+                   value="{{ agent.workdir if agent else '' }}"
+                   placeholder="/home/pi/agents/my-agent"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
+            <p class="text-xs text-slate-600 mt-1">Absolute path. The directory is created automatically on save.</p>
+          </div>
+          {% if not agent %}
+          <label class="flex items-start gap-2.5 cursor-pointer select-none group">
+            <input type="checkbox" name="init_folder" value="true" checked
+                   class="mt-0.5 accent-indigo-500 shrink-0">
+            <span>
+              <span class="text-sm text-slate-300 group-hover:text-slate-100 transition-colors">Initialize with starter AGENTS.md</span>
+              <span class="block text-xs text-slate-500 mt-0.5">Creates a chit-chat personality file and the <code class="text-slate-400">reminders/</code> and <code class="text-slate-400">inbox/</code> folders. Skipped if AGENTS.md already exists.</span>
+            </span>
+          </label>
+          {% endif %}
         </div>
       </div>
     </div>
@@ -188,7 +200,7 @@
           <li>Create a Telegram bot via @BotFather</li>
           <li>Paste the token into the Token Value field</li>
           <li>Message the bot once, then get your chat ID from getUpdates</li>
-          <li>Set a workdir path and optionally add an AGENTS.md there</li>
+          <li>Set a workdir path — check "Initialize" for a ready-to-use AGENTS.md</li>
           <li>Save, then start the bridge from the sidebar</li>
         </ol>
       </div>

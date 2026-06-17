@@ -202,18 +202,29 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
 # Telegram
 # --------------------------------------------------------------------------- #
 
-def send(api: str, chat_id: int, text: str, parse_mode: str | None = None) -> None:
+def send(api: str, chat_id: int, text: str, parse_mode: str | None = None,
+         buttons: list[str] | None = None) -> None:
     """Send a reply, splitting on Telegram's 4096-char limit.
 
     parse_mode is left unset for normal agent replies (plain text, no escaping
     needed). Pass "HTML" for messages the bridge formats itself (e.g. reminders);
     any dynamic text in those must be html.escape()'d by the caller first.
+    buttons, if given, are attached as an inline keyboard to the final chunk.
     """
     text = text or "(no output)"
-    for i in range(0, len(text), TELEGRAM_LIMIT):
+    reply_markup = None
+    if buttons:
+        rows = []
+        for i in range(0, len(buttons), 3):
+            rows.append([{"text": b, "callback_data": b[:64]} for b in buttons[i:i+3]])
+        reply_markup = {"inline_keyboard": rows}
+    chunks = range(0, len(text), TELEGRAM_LIMIT)
+    for i in chunks:
         payload = {"chat_id": chat_id, "text": text[i : i + TELEGRAM_LIMIT]}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup and i + TELEGRAM_LIMIT >= len(text):
+            payload["reply_markup"] = reply_markup
         requests.post(f"{api}/sendMessage", json=payload, timeout=30)
 
 
@@ -221,6 +232,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 # The agent emits this marker to have the bridge send a file; it is removed from
 # the visible reply. e.g.  [[send: wiki/files/chart.png]]
 SEND_MARKER = re.compile(r"\[\[send:\s*(.+?)\]\]")
+# The agent emits this marker to attach inline buttons to its reply.
+# e.g.  [[buttons: Yes, save it | No, discard]]
+BUTTON_MARKER = re.compile(r"\[\[buttons:\s*(.+?)\]\]", re.DOTALL)
 
 
 def http(method: str, url: str, **kwargs):
@@ -359,6 +373,16 @@ def split_outgoing(reply: str, workdir: Path):
     return clean, paths
 
 
+def split_buttons(reply: str):
+    """Pull [[buttons: A | B | C]] marker out of a reply; return (clean_text, [labels])."""
+    m = BUTTON_MARKER.search(reply)
+    if not m:
+        return reply, []
+    labels = [l.strip() for l in m.group(1).split("|") if l.strip()]
+    clean = BUTTON_MARKER.sub("", reply).strip()
+    return clean, labels
+
+
 def send_file(api: str, chat_id: int, path: Path) -> None:
     """Send a local file as a photo (if an image) or document."""
     if not path.exists():
@@ -463,8 +487,9 @@ def worker(bot: Bot) -> None:
                         model=bot.model, timeout=bot.timeout, chat_id=chat_id,
                     )
             clean, to_send = split_outgoing(reply, bot.workdir)
+            clean, button_labels = split_buttons(clean)
             if clean:
-                send(bot.api, chat_id, clean)
+                send(bot.api, chat_id, clean, buttons=button_labels or None)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
             # Record the exchange for future context (no-op if history disabled).
@@ -482,6 +507,90 @@ def worker(bot: Bot) -> None:
                 pass
         finally:
             bot.queue.task_done()
+
+
+def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
+    """Handle bridge-level slash commands without invoking the agent.
+
+    Returns True if the command was handled (caller should skip enqueuing),
+    False if it should be passed to the agent as a normal message.
+    """
+    cmd = text.strip().split()[0].lower()
+
+    if cmd == "/status":
+        rem_dir = bot.workdir / "reminders"
+        n_reminders = n_scheduled = 0
+        if rem_dir.exists():
+            for f in rem_dir.glob("*.json"):
+                try:
+                    entry = json.loads(f.read_text(encoding="utf-8"))
+                    if entry.get("type") == "schedule":
+                        n_scheduled += 1
+                    else:
+                        n_reminders += 1
+                except Exception:
+                    pass
+        lines = [
+            f"Agent: {bot.name}",
+            f"Model: {bot.model or '(opencode default)'}",
+            f"Session: {'continuous' if bot.keep_context else 'stateless'}",
+            f"History: {bot.history} messages" if bot.history else "History: off",
+            f"Reminders pending: {n_reminders}",
+            f"Scheduled runs pending: {n_scheduled}",
+        ]
+        send(bot.api, chat_id, "\n".join(lines))
+        return True
+
+    if cmd == "/reminders":
+        rem_dir = bot.workdir / "reminders"
+        items = []
+        if rem_dir.exists():
+            for f in sorted(rem_dir.glob("*.json")):
+                try:
+                    entry = json.loads(f.read_text(encoding="utf-8"))
+                    if entry.get("type") == "schedule":
+                        continue
+                    due = datetime.fromisoformat(entry["due"])
+                    items.append(f"• {due:%Y-%m-%d %H:%M}  {entry.get('text', '(no text)')}")
+                except Exception:
+                    pass
+        send(bot.api, chat_id, ("Pending reminders:\n" + "\n".join(items)) if items else "No reminders pending.")
+        return True
+
+    if cmd == "/scheduled":
+        rem_dir = bot.workdir / "reminders"
+        items = []
+        if rem_dir.exists():
+            for f in sorted(rem_dir.glob("*.json")):
+                try:
+                    entry = json.loads(f.read_text(encoding="utf-8"))
+                    if entry.get("type") != "schedule":
+                        continue
+                    due = datetime.fromisoformat(entry["due"])
+                    items.append(f"• {due:%Y-%m-%d %H:%M}  {entry.get('prompt', '(no prompt)')}")
+                except Exception:
+                    pass
+        send(bot.api, chat_id, ("Scheduled runs:\n" + "\n".join(items)) if items else "No scheduled runs pending.")
+        return True
+
+    if cmd == "/help":
+        lines = [
+            "Bridge commands (no agent call):",
+            "  /status — agent info and pending counts",
+            "  /reminders — list pending reminders",
+            "  /scheduled — list scheduled agent runs",
+            "  /help — this message",
+            "",
+            "Agent commands (handled by the agent):",
+            "  /remind <when> \"<message>\" — set a plain-text reminder",
+            "  /schedule <when> \"<prompt>\" — schedule an agent run",
+            "",
+            "Natural language works for all of the above too.",
+        ]
+        send(bot.api, chat_id, "\n".join(lines))
+        return True
+
+    return False
 
 
 def poller(bot: Bot) -> None:
@@ -502,6 +611,22 @@ def poller(bot: Bot) -> None:
 
         for update in resp.get("result", []):
             offset = update["update_id"] + 1
+
+            # Button tap: callback_query arrives instead of a message.
+            cb = update.get("callback_query")
+            if cb:
+                chat_id = cb["message"]["chat"]["id"]
+                # Acknowledge immediately so Telegram removes the loading spinner.
+                requests.post(f"{bot.api}/answerCallbackQuery",
+                              json={"callback_query_id": cb["id"]}, timeout=10)
+                if chat_id not in bot.allowed_ids:
+                    continue
+                tapped = cb.get("data", "").strip()
+                if tapped:
+                    print(f"[{bot.name}] button tapped: {tapped!r}")
+                    bot.queue.put((chat_id, tapped, [], [], False))
+                continue
+
             msg = update.get("message") or update.get("edited_message")
             if not msg:
                 continue
@@ -511,6 +636,22 @@ def poller(bot: Bot) -> None:
                 continue
 
             text = msg.get("text") or msg.get("caption") or ""
+
+            # Include context when the user quotes or replies to a message.
+            # quote (partial text selection) takes priority over the full reply.
+            reply_ctx = ""
+            if "quote" in msg:
+                q = msg["quote"].get("text", "").strip()
+                if q:
+                    reply_ctx = f'[Quoting: "{q}"]'
+            elif "reply_to_message" in msg:
+                r = msg["reply_to_message"]
+                r_text = (r.get("text") or r.get("caption") or "").strip()
+                if r_text:
+                    reply_ctx = f'[Replying to: "{r_text}"]'
+            if reply_ctx:
+                text = f"{reply_ctx}\n{text}" if text else reply_ctx
+
             attachments = []  # (file_id, suggested_name) -> handed to the agent
             voice_ids = []    # transcribed to text before reaching the agent
             if "photo" in msg:
@@ -525,6 +666,12 @@ def poller(bot: Bot) -> None:
 
             if not text and not attachments and not voice_ids:
                 continue  # ignore stickers, locations, etc.
+
+            # Bridge-level slash commands are handled here without an agent call.
+            raw_text = msg.get("text") or msg.get("caption") or ""
+            if raw_text.startswith("/") and handle_command(bot, chat_id, raw_text):
+                continue
+
             print(f"[{bot.name}] > {text!r} (+{len(attachments)} file, +{len(voice_ids)} audio)")
             bot.queue.put((chat_id, text, attachments, voice_ids, False))
 
@@ -576,13 +723,24 @@ def scheduler(bot: Bot) -> None:
                     continue
                 if due <= now:
                     chat_id = entry.get("chat_id", bot.default_chat_id)
-                    text = entry.get("text") or "(reminder)"
-                    try:
-                        body = f"<b>{REMINDER_PREFIX}</b>: {html.escape(text, quote=False)}"
-                        send(bot.api, chat_id, body, parse_mode="HTML")
-                        print(f"[{bot.name}] reminder delivered: {text!r}")
-                    except Exception as e:
-                        print(f"[{bot.name}] reminder send failed:", e)
+                    if entry.get("type") == "schedule":
+                        # Self-scheduled agent run: enqueue to the worker like a cron job.
+                        user_prompt = entry.get("prompt", "").strip()
+                        due_fmt = due.strftime("%Y-%m-%d at %H:%M")
+                        invocation = (
+                            f"You are invoked because you scheduled yourself to run on "
+                            f"{due_fmt}. You wanted to do the following: \"{user_prompt}\""
+                        )
+                        bot.queue.put((chat_id, invocation, [], [], True))
+                        print(f"[{bot.name}] scheduled run enqueued: {user_prompt!r}")
+                    else:
+                        text = entry.get("text") or "(reminder)"
+                        try:
+                            body = f"<b>{REMINDER_PREFIX}</b>: {html.escape(text, quote=False)}"
+                            send(bot.api, chat_id, body, parse_mode="HTML")
+                            print(f"[{bot.name}] reminder delivered: {text!r}")
+                        except Exception as e:
+                            print(f"[{bot.name}] reminder send failed:", e)
                     f.unlink(missing_ok=True)
 
         # Cron schedules -> enqueue a prompt for the worker.
