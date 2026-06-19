@@ -92,6 +92,10 @@
               class="w-full text-xs px-3 py-2 rounded-lg font-medium transition-colors bg-slate-800 text-slate-400 cursor-wait">
         …
       </button>
+      <button id="sb-restart" onclick="restartBridge()" style="display:none"
+              class="w-full text-xs px-3 py-2 rounded-lg font-medium transition-colors bg-slate-800 text-amber-400 hover:bg-amber-950">
+        Restart Bridge
+      </button>
       <p class="text-center text-xs text-slate-600">port 7860</p>
     </div>
   </aside>
@@ -114,18 +118,21 @@
         const dot   = document.getElementById('sb-dot');
         const label = document.getElementById('sb-label');
         const btn   = document.getElementById('sb-btn');
+        const restart = document.getElementById('sb-restart');
         if (d.running) {
           dot.className   = 'inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse';
           label.textContent = 'Running · PID ' + d.pid;
           label.className = 'text-xs text-green-400';
           btn.textContent = 'Stop Bridge';
           btn.className   = 'w-full text-xs px-3 py-2 rounded-lg font-medium transition-colors bg-red-950 text-red-300 hover:bg-red-900';
+          restart.style.display = '';
         } else {
           dot.className   = 'inline-block w-2 h-2 rounded-full bg-slate-600';
           label.textContent = 'Bridge stopped';
           label.className = 'text-xs text-slate-500';
           btn.textContent = 'Start Bridge';
           btn.className   = 'w-full text-xs px-3 py-2 rounded-lg font-medium transition-colors bg-green-950 text-green-300 hover:bg-green-900';
+          restart.style.display = 'none';
         }
       } catch(e) {
         document.getElementById('sb-label').textContent = 'Unavailable';
@@ -140,6 +147,17 @@
       await new Promise(r => setTimeout(r, 600));
       await fetchStatus();
       btn.disabled = false;
+    }
+
+    async function restartBridge() {
+      const btn = document.getElementById('sb-restart');
+      btn.disabled = true;
+      btn.textContent = 'Restarting…';
+      await fetch('/api/bridge/restart', { method: 'POST' });
+      await new Promise(r => setTimeout(r, 1200));
+      await fetchStatus();
+      btn.disabled = false;
+      btn.textContent = 'Restart Bridge';
     }
 
     fetchStatus();

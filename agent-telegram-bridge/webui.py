@@ -370,6 +370,14 @@ async def bridge_stop():
     return JSONResponse({"ok": True, "status": "stopped"})
 
 
+@app.post("/api/bridge/restart")
+async def bridge_restart():
+    _do_stop_bridge()
+    time.sleep(1)
+    _do_start_bridge()
+    return JSONResponse({"ok": True, "status": "restarted", "pid": _bridge_proc.pid if _bridge_running() else None})
+
+
 @app.get("/api/bridge/status")
 async def api_bridge_status():
     return JSONResponse(_bridge_status())
