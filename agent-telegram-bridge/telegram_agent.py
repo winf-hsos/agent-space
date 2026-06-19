@@ -1601,21 +1601,21 @@ def _docstring_first_line(path: Path) -> str:
 
 def register_commands(bot: "Bot") -> None:
     """Push the bot's slash-command list to Telegram via setMyCommands."""
-    BUILTIN = [
+    BUILTIN = sorted([
         ("status",    "Agentinfo und ausstehende Aufgaben"),
         ("reminders", "Ausstehende Erinnerungen anzeigen"),
         ("scheduled", "Geplante Ausführungen anzeigen"),
         ("help",      "Verfügbare Befehle anzeigen"),
-    ]
-    commands = [{"command": cmd, "description": desc} for cmd, desc in BUILTIN]
+    ])
 
+    commands = []
     cmd_dir = bot.workdir / "commands"
     if cmd_dir.is_dir():
         for script in sorted(cmd_dir.glob("*.py")):
             desc = _docstring_first_line(script) or f"/{script.stem}"
-            # Strip leading "Bridge command /name — " prefix if present
             desc = re.sub(r"^Bridge command\s+/\w+\s*[—-]\s*", "", desc, flags=re.IGNORECASE)
             commands.append({"command": script.stem, "description": desc[:256]})
+    commands += [{"command": cmd, "description": desc} for cmd, desc in BUILTIN]
 
     try:
         resp = requests.post(
