@@ -17,12 +17,14 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
 BRIDGE_DIR = Path(__file__).resolve().parent
+load_dotenv(BRIDGE_DIR / ".env")  # populate os.environ from .env before reading any env vars
 REPO_DIR = BRIDGE_DIR.parent                          # agent-space/
 MY_AGENTS_DIR = REPO_DIR.parent / "my-agents"        # sibling repo, pulled if present
 CONFIG_PATH = BRIDGE_DIR / "agents.yaml"
