@@ -9,6 +9,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -20,15 +23,92 @@ from fastapi.templating import Jinja2Templates
 import uvicorn
 
 BRIDGE_DIR = Path(__file__).resolve().parent
+REPO_DIR = BRIDGE_DIR.parent                          # agent-space/
+MY_AGENTS_DIR = REPO_DIR.parent / "my-agents"        # sibling repo, pulled if present
 CONFIG_PATH = BRIDGE_DIR / "agents.yaml"
 ENV_PATH = BRIDGE_DIR / ".env"
 HISTORY_DIR = BRIDGE_DIR / "history"
 TOOLS_DIR = Path(os.environ.get("AGENT_TOOLS_DIR", BRIDGE_DIR.parent / "agent-tools")).resolve()
 SHARED_INSTRUCTIONS_PATH = TOOLS_DIR / "shared" / "agents-common.md"
+AUTO_UPDATE_INTERVAL = int(os.environ.get("AUTO_UPDATE_INTERVAL", "0"))  # 0 = disabled
 
-app = FastAPI(title="Agent Manager")
-templates = Jinja2Templates(directory=str(BRIDGE_DIR / "templates"))
 _bridge_proc: Optional[subprocess.Popen] = None
+_bridge_lock = threading.Lock()
+_last_update_check: Optional[str] = None
+_last_update_result: Optional[str] = None  # "up-to-date" | "updated" | "error"
+
+
+# ── Auto-update ────────────────────────────────────────────────────────────────
+
+def _git_head(repo: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _git_pull(repo: Path) -> bool:
+    """Pull repo. Returns True if HEAD changed (new commits arrived)."""
+    before = _git_head(repo)
+    if not before:
+        return False
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "pull", "--quiet"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:
+        print(f"[webui] git pull failed for {repo.name}: {e}")
+        return False
+    after = _git_head(repo)
+    return bool(after) and before != after
+
+
+def _auto_update_loop() -> None:
+    global _last_update_check, _last_update_result
+    while True:
+        time.sleep(AUTO_UPDATE_INTERVAL)
+        _last_update_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            changed = _git_pull(REPO_DIR)
+            if MY_AGENTS_DIR.exists():
+                changed |= _git_pull(MY_AGENTS_DIR)
+            if changed:
+                print("[webui] New commits — updating deps and restarting bridge")
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "-r",
+                     str(BRIDGE_DIR / "requirements.txt")],
+                    timeout=120,
+                )
+                was_running = _bridge_running()
+                _do_stop_bridge()
+                if was_running:
+                    time.sleep(2)
+                    _do_start_bridge()
+                    print("[webui] Bridge restarted with updated code")
+                _last_update_result = "updated"
+            else:
+                _last_update_result = "up-to-date"
+        except Exception as e:
+            print(f"[webui] Auto-update error: {e}")
+            _last_update_result = "error"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if AUTO_UPDATE_INTERVAL > 0:
+        t = threading.Thread(target=_auto_update_loop, daemon=True)
+        t.start()
+        print(f"[webui] Auto-update enabled — polling every {AUTO_UPDATE_INTERVAL}s")
+    yield
+
+
+app = FastAPI(title="Agent Manager", lifespan=lifespan)
+templates = Jinja2Templates(directory=str(BRIDGE_DIR / "templates"))
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -159,7 +239,35 @@ def _bridge_running() -> bool:
 
 def _bridge_status() -> dict:
     running = _bridge_running()
-    return {"running": running, "pid": _bridge_proc.pid if running else None}
+    return {
+        "running": running,
+        "pid": _bridge_proc.pid if running else None,
+        "last_update_check": _last_update_check,
+        "last_update_result": _last_update_result,
+    }
+
+
+def _do_start_bridge() -> None:
+    global _bridge_proc
+    with _bridge_lock:
+        if _bridge_running():
+            return
+        _bridge_proc = subprocess.Popen(
+            [sys.executable, str(BRIDGE_DIR / "telegram_agent.py")],
+            cwd=str(BRIDGE_DIR),
+        )
+
+
+def _do_stop_bridge() -> None:
+    global _bridge_proc
+    with _bridge_lock:
+        if _bridge_proc and _bridge_proc.poll() is None:
+            _bridge_proc.terminate()
+            try:
+                _bridge_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _bridge_proc.kill()
+        _bridge_proc = None
 
 
 # ── Template globals ───────────────────────────────────────────────────────────
@@ -233,26 +341,15 @@ async def dashboard(request: Request):
 
 @app.post("/api/bridge/start")
 async def bridge_start():
-    global _bridge_proc
     if _bridge_running():
         return JSONResponse({"ok": True, "status": "already_running", "pid": _bridge_proc.pid})
-    _bridge_proc = subprocess.Popen(
-        [sys.executable, str(BRIDGE_DIR / "telegram_agent.py")],
-        cwd=str(BRIDGE_DIR),
-    )
+    _do_start_bridge()
     return JSONResponse({"ok": True, "status": "started", "pid": _bridge_proc.pid})
 
 
 @app.post("/api/bridge/stop")
 async def bridge_stop():
-    global _bridge_proc
-    if _bridge_proc and _bridge_proc.poll() is None:
-        _bridge_proc.terminate()
-        try:
-            _bridge_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _bridge_proc.kill()
-    _bridge_proc = None
+    _do_stop_bridge()
     return JSONResponse({"ok": True, "status": "stopped"})
 
 
