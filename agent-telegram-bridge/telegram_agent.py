@@ -208,13 +208,13 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
 # Telegram
 # --------------------------------------------------------------------------- #
 
-def send(api: str, chat_id: int, text: str, parse_mode: str | None = "MarkdownV2",
+def send(api: str, chat_id: int, text: str, parse_mode: str | None = "HTML",
          buttons: list[str] | None = None,
          reply_keyboard: "list[str] | str | None" = None,
          inline_buttons: list[str] | None = None) -> None:
     """Send a reply, splitting on Telegram's 4096-char limit.
 
-    Defaults to MarkdownV2 so agents can use *bold*, _italic_, `code`, etc.
+    Defaults to HTML so agents can use <b>bold</b>, <i>italic</i>, <code>text</code>.
     Falls back to plain text automatically if Telegram rejects the formatting.
     buttons attaches a one-time reply keyboard to the final chunk.
     reply_keyboard sets/replaces the persistent bottom keyboard; pass 'remove' to dismiss it.
