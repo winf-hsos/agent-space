@@ -164,20 +164,31 @@ def _bridge_status() -> dict:
 
 # ── Template globals ───────────────────────────────────────────────────────────
 
-def _fmt_ts(ts) -> str:
+def _parse_ts(ts) -> "float | None":
     if ts is None:
+        return None
+    try:
+        return datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        return None
+
+
+def _fmt_ts(ts) -> str:
+    t = _parse_ts(ts)
+    if t is None:
         return "—"
     try:
-        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+        return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return "—"
 
 
 def _fmt_rel(ts) -> str:
-    if ts is None:
+    t = _parse_ts(ts)
+    if t is None:
         return "never"
     try:
-        delta = datetime.now().timestamp() - int(ts)
+        delta = datetime.now().timestamp() - t
         if delta < 60:
             return "just now"
         if delta < 3600:
