@@ -254,6 +254,7 @@ def _do_start_bridge() -> None:
     with _bridge_lock:
         if _bridge_running():
             return
+        load_dotenv(BRIDGE_DIR / ".env", override=True)
         _bridge_proc = subprocess.Popen(
             [sys.executable, str(BRIDGE_DIR / "telegram_agent.py")],
             cwd=str(BRIDGE_DIR),
