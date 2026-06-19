@@ -54,16 +54,29 @@ def _git_head(repo: Path) -> str:
         return ""
 
 
-def _git_pull(repo: Path) -> bool:
-    """Pull repo. Returns True if HEAD changed (new commits arrived)."""
+def _git_pull(repo: Path, force: bool = False) -> bool:
+    """Pull repo. Returns True if HEAD changed (new commits arrived).
+
+    force=True: fetch + reset --hard so remote always wins over local changes.
+    """
     before = _git_head(repo)
     if not before:
         return False
     try:
-        subprocess.run(
-            ["git", "-C", str(repo), "pull", "--quiet"],
-            capture_output=True, text=True, timeout=60,
-        )
+        if force:
+            subprocess.run(
+                ["git", "-C", str(repo), "fetch", "origin"],
+                capture_output=True, text=True, timeout=60,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "reset", "--hard", "FETCH_HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+        else:
+            subprocess.run(
+                ["git", "-C", str(repo), "pull", "--quiet"],
+                capture_output=True, text=True, timeout=60,
+            )
     except Exception as e:
         print(f"[webui] git pull failed for {repo.name}: {e}")
         return False
@@ -79,7 +92,7 @@ def _auto_update_loop() -> None:
         try:
             changed = _git_pull(REPO_DIR)
             if MY_AGENTS_DIR and MY_AGENTS_DIR.exists():
-                changed |= _git_pull(MY_AGENTS_DIR)
+                changed |= _git_pull(MY_AGENTS_DIR, force=True)
             if changed:
                 print("[webui] New commits — updating deps and restarting bridge")
                 subprocess.run(
