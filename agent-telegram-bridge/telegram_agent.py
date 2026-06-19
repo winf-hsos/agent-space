@@ -856,12 +856,17 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
             "  /status — Agentinfo und ausstehende Aufgaben",
             "  /reminders — Ausstehende Erinnerungen anzeigen",
             "  /scheduled — Geplante Ausführungen anzeigen",
-            "  /list [Geschäft] — Einkaufsliste abhaken (Geschäft wählen oder direkt angeben)",
-            "  /catalog <Geschäft> — Katalog antippen und zur Liste hinzufügen",
-            "  /stores — Alle Geschäfte anzeigen und Katalog öffnen",
-            "  /clear_list — Einkaufsliste leeren",
             "  /help — Diese Übersicht",
         ]
+        if (bot.workdir / "food.db").exists():
+            lines += [
+                "",
+                "Einkauf (kein Agentaufruf):",
+                "  /list [Geschäft] — Einkaufsliste abhaken (Geschäft wählen oder direkt angeben)",
+                "  /catalog <Geschäft> — Katalog antippen und zur Liste hinzufügen",
+                "  /stores — Alle Geschäfte anzeigen und Katalog öffnen",
+                "  /clear_list — Einkaufsliste leeren",
+            ]
         local_cmds = sorted((bot.workdir / "commands").glob("*.py")) if (bot.workdir / "commands").is_dir() else []
         if local_cmds:
             lines.append("")
@@ -1607,15 +1612,19 @@ def register_commands(bot: "Bot") -> None:
     """Push the bot's slash-command list to Telegram via setMyCommands."""
     BUILTIN = [
         ("status",    "Agentinfo und ausstehende Aufgaben"),
-        ("list",      "Einkaufsliste abhaken — Geschäft wählen oder direkt angeben"),
-        ("catalog",   "Katalog für ein Geschäft — antippen zum Hinzufügen"),
-        ("stores",    "Alle Geschäfte anzeigen und Katalog öffnen"),
-        ("clear_list", "Einkaufsliste leeren"),
         ("reminders", "Ausstehende Erinnerungen anzeigen"),
         ("scheduled", "Geplante Ausführungen anzeigen"),
         ("help",      "Verfügbare Befehle anzeigen"),
     ]
+    FOOD_BUILTIN = [
+        ("list",      "Einkaufsliste abhaken — Geschäft wählen oder direkt angeben"),
+        ("catalog",   "Katalog für ein Geschäft — antippen zum Hinzufügen"),
+        ("stores",    "Alle Geschäfte anzeigen und Katalog öffnen"),
+        ("clear_list", "Einkaufsliste leeren"),
+    ]
     commands = [{"command": cmd, "description": desc} for cmd, desc in BUILTIN]
+    if (bot.workdir / "food.db").exists():
+        commands += [{"command": cmd, "description": desc} for cmd, desc in FOOD_BUILTIN]
 
     cmd_dir = bot.workdir / "commands"
     if cmd_dir.is_dir():
