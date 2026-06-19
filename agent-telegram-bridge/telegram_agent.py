@@ -496,7 +496,7 @@ def typing_indicator(api: str, chat_id: int):
 class Bot:
     def __init__(self, name, token, allowed_ids, workdir, keep_context,
                  model=None, timeout=RUN_TIMEOUT, schedules=None, default_chat_id=None,
-                 history=0):
+                 history=0, builtin_commands=None):
         self.name = name
         self.token = token
         self.api = f"https://api.telegram.org/bot{token}"
@@ -508,6 +508,7 @@ class Bot:
         self.schedules = schedules or []          # cron entries from agents.yaml
         self.default_chat_id = default_chat_id     # for proactive msgs lacking a chat
         self.history = history                     # how many past messages to replay
+        self.builtin_commands: set = set(builtin_commands or [])
         # each item: (chat_id, text, [(file_id, name), ...], [voice_id, ...], proactive)
         # proactive=True for cron-triggered runs (don't log their prompt as a user msg)
         self.queue: "queue.Queue[tuple]" = queue.Queue()
@@ -858,7 +859,8 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
             "  /scheduled — Geplante Ausführungen anzeigen",
             "  /help — Diese Übersicht",
         ]
-        if (bot.workdir / "food.db").exists():
+        food_cmds = {"list", "catalog", "stores", "clear_list"}
+        if bot.builtin_commands & food_cmds:
             lines += [
                 "",
                 "Einkauf (kein Agentaufruf):",
@@ -1588,8 +1590,9 @@ def load_config():
         # Reminders/cron without an explicit chat default to the lowest allowed id.
         default_chat_id = sorted(allowed)[0]
         history = int(entry.get("history", 0))  # 0/absent = off
+        builtin_commands = entry.get("builtin_commands") or []
         bots.append(Bot(name, token, allowed, workdir, keep_context, model,
-                        timeout, schedules, default_chat_id, history))
+                        timeout, schedules, default_chat_id, history, builtin_commands))
 
     if not bots:
         raise SystemExit(f"No bots configured in {CONFIG_PATH}.")
@@ -1610,21 +1613,20 @@ def _docstring_first_line(path: Path) -> str:
 
 def register_commands(bot: "Bot") -> None:
     """Push the bot's slash-command list to Telegram via setMyCommands."""
-    BUILTIN = [
-        ("status",    "Agentinfo und ausstehende Aufgaben"),
-        ("reminders", "Ausstehende Erinnerungen anzeigen"),
-        ("scheduled", "Geplante Ausführungen anzeigen"),
-        ("help",      "Verfügbare Befehle anzeigen"),
-    ]
-    FOOD_BUILTIN = [
-        ("list",      "Einkaufsliste abhaken — Geschäft wählen oder direkt angeben"),
-        ("catalog",   "Katalog für ein Geschäft — antippen zum Hinzufügen"),
-        ("stores",    "Alle Geschäfte anzeigen und Katalog öffnen"),
-        ("clear_list", "Einkaufsliste leeren"),
-    ]
-    commands = [{"command": cmd, "description": desc} for cmd, desc in BUILTIN]
-    if (bot.workdir / "food.db").exists():
-        commands += [{"command": cmd, "description": desc} for cmd, desc in FOOD_BUILTIN]
+    ALL_BUILTIN = {
+        "status":    "Agentinfo und ausstehende Aufgaben",
+        "reminders": "Ausstehende Erinnerungen anzeigen",
+        "scheduled": "Geplante Ausführungen anzeigen",
+        "help":      "Verfügbare Befehle anzeigen",
+        "list":      "Einkaufsliste abhaken — Geschäft wählen oder direkt angeben",
+        "catalog":   "Katalog für ein Geschäft — antippen zum Hinzufügen",
+        "stores":    "Alle Geschäfte anzeigen und Katalog öffnen",
+        "clear_list": "Einkaufsliste leeren",
+    }
+    # Always-on built-ins + whatever is declared in agents.yaml
+    always = ["status", "reminders", "scheduled", "help"]
+    enabled = always + [c for c in bot.builtin_commands if c in ALL_BUILTIN and c not in always]
+    commands = [{"command": cmd, "description": ALL_BUILTIN[cmd]} for cmd in enabled]
 
     cmd_dir = bot.workdir / "commands"
     if cmd_dir.is_dir():
