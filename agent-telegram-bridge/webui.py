@@ -26,7 +26,8 @@ import uvicorn
 BRIDGE_DIR = Path(__file__).resolve().parent
 load_dotenv(BRIDGE_DIR / ".env")  # populate os.environ from .env before reading any env vars
 REPO_DIR = BRIDGE_DIR.parent                          # agent-space/
-MY_AGENTS_DIR = REPO_DIR.parent / "my-agents"        # sibling repo, pulled if present
+_agents_dir_env = os.environ.get("AUTO_UPDATE_AGENTS_DIR", "")
+MY_AGENTS_DIR: Optional[Path] = Path(_agents_dir_env) if _agents_dir_env else None
 CONFIG_PATH = BRIDGE_DIR / "agents.yaml"
 ENV_PATH = BRIDGE_DIR / ".env"
 HISTORY_DIR = BRIDGE_DIR / "history"
@@ -77,7 +78,7 @@ def _auto_update_loop() -> None:
         _last_update_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             changed = _git_pull(REPO_DIR)
-            if MY_AGENTS_DIR.exists():
+            if MY_AGENTS_DIR and MY_AGENTS_DIR.exists():
                 changed |= _git_pull(MY_AGENTS_DIR)
             if changed:
                 print("[webui] New commits — updating deps and restarting bridge")
