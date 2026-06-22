@@ -554,9 +554,10 @@ def worker(bot: Bot) -> None:
             clean, button_labels = split_buttons(clean)
             clean, inline_labels = split_inline(clean)
             clean, kbd = split_keyboard(clean)
-            # For proactive (cron) runs, the agent may use the `chat_respond` tool
-            # to send messages directly — suppress the empty fallback in that case.
-            if clean and not (proactive and clean == "(no output)"):
+            # Proactive (cron) runs communicate exclusively via chat_respond — the
+            # bridge never sends the final text output for those, since it is almost
+            # always model narration rather than a message meant for Nicolas.
+            if clean and not proactive:
                 send(bot.api, chat_id, clean,
                      buttons=button_labels or None,
                      inline_buttons=inline_labels or None,

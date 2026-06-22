@@ -164,20 +164,19 @@ from Nicolas — e.g. a morning check-in. Treat the prompt as the trigger. If yo
 have something genuinely useful to say, say it in one short message. If not, it is
 fine to stay silent — do not invent activity just to fill the message.
 
-### Sending multiple messages with `chat_respond`
+### Sending messages with `chat_respond`
 
-For proactive runs that produce more than one natural message (e.g. one reminder
-per person found), use the `chat_respond` tool instead of outputting text:
+For proactive runs, **`chat_respond` is the only way to send messages to
+Nicolas**. The bridge ignores any text you output — it is discarded, not sent.
+Call `chat_respond` once per message you want him to receive:
 
 ```sh
 chat_respond "Your message here"
 ```
 
-`chat_respond` posts the message to Telegram immediately — each call sends one
-message. HTML formatting is supported (`<b>bold</b>`, `<i>italic</i>`).
-When you use `chat_respond`, output nothing as your final reply; the bridge
-will suppress the empty placeholder. If there is nothing to report, stay silent
-(output nothing).
+`chat_respond` posts immediately — each call is one Telegram message. HTML
+formatting is supported (`<b>bold</b>`, `<i>italic</i>`). If there is nothing
+to report, simply do not call it — stay silent.
 
 ```sh
 # Example: one message per match found during a check
