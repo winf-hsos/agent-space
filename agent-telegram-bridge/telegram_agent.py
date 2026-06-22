@@ -41,6 +41,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import requests
@@ -78,6 +79,12 @@ TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "whisper-1")
 
 # Caps concurrent agent runs across all bots; replaced in main() from the config.
 AGENT_SLOTS = threading.Semaphore(1)
+
+# Internal HTTP server for chat_respond tool routing (localhost only).
+# chat_respond POSTs here so the bridge can process markers before sending.
+INTERNAL_PORT = int(os.environ.get("BRIDGE_INTERNAL_PORT", "7861"))
+BRIDGE_INTERNAL_URL: str | None = None  # set in main() after server starts
+_bots_by_token: dict = {}               # token → Bot, populated in main()
 
 
 def _resolve_opencode():
@@ -187,6 +194,8 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
         env["TELEGRAM_CHAT_ID"] = str(chat_id)
     if token is not None:
         env["TELEGRAM_BOT_TOKEN"] = token
+    if BRIDGE_INTERNAL_URL:
+        env["BRIDGE_INTERNAL_URL"] = BRIDGE_INTERNAL_URL
     try:
         result = subprocess.run(
             cmd,
@@ -550,18 +559,11 @@ def worker(bot: Bot) -> None:
                         model=bot.model, timeout=bot.timeout, chat_id=chat_id,
                         token=bot.token,
                     )
-            clean, to_send = split_outgoing(reply, bot.workdir)
-            clean, button_labels = split_buttons(clean)
-            clean, inline_labels = split_inline(clean)
-            clean, kbd = split_keyboard(clean)
-            # Proactive (cron) runs communicate exclusively via chat_respond — the
-            # bridge never sends the final text output for those, since it is almost
-            # always model narration rather than a message meant for Nicolas.
-            if clean and not proactive:
-                send(bot.api, chat_id, clean,
-                     buttons=button_labels or None,
-                     inline_buttons=inline_labels or None,
-                     reply_keyboard=kbd)
+            # Agents communicate exclusively via the chat_respond tool, which
+            # routes through the bridge's internal server. Final text output is
+            # discarded — it's almost always model narration, not a user message.
+            # [[send: path]] markers are still honoured for file delivery.
+            _, to_send = split_outgoing(reply, bot.workdir)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
             # Record the exchange for future context (no-op if history disabled).
@@ -570,7 +572,7 @@ def worker(bot: Bot) -> None:
                 user_log = None
             else:
                 user_log = text or ("[sent a file]" if attachments else None)
-            log_turn(bot, chat_id, user_log, clean)
+            log_turn(bot, chat_id, user_log, None)
         except Exception as e:  # never let one bad message kill the worker
             print(f"[{bot.name}] worker error:", e)
             try:
@@ -1638,13 +1640,79 @@ def register_commands(bot: "Bot") -> None:
         print(f"[{bot.name}] setMyCommands error: {e}")
 
 
+class _InternalHandler(BaseHTTPRequestHandler):
+    """Handle POST /send requests from the chat_respond tool.
+
+    chat_respond posts JSON {token, chat_id, text} here. The bridge looks up
+    the bot by token, processes markers (buttons, inline keyboards, file sends),
+    and delivers the message exactly as if it came from the worker.
+    """
+
+    def do_POST(self) -> None:
+        if self.path != "/send":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length))
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        token   = body.get("token", "")
+        text    = body.get("text", "")
+        chat_id = body.get("chat_id")
+        bot     = _bots_by_token.get(token)
+        if not bot or chat_id is None:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        try:
+            chat_id = int(chat_id)
+            clean, to_send = split_outgoing(text, bot.workdir)
+            clean, button_labels = split_buttons(clean)
+            clean, inline_labels = split_inline(clean)
+            clean, kbd           = split_keyboard(clean)
+            if clean:
+                send(bot.api, chat_id, clean,
+                     buttons=button_labels or None,
+                     inline_buttons=inline_labels or None,
+                     reply_keyboard=kbd)
+            for path in to_send:
+                send_file(bot.api, chat_id, path)
+        except Exception as e:
+            print(f"[internal] send error: {e}")
+            self.send_response(500)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args) -> None:
+        pass  # suppress HTTP access log
+
+
+def start_internal_server() -> int:
+    """Start the internal send server on localhost. Returns the bound port."""
+    server = ThreadingHTTPServer(("127.0.0.1", INTERNAL_PORT), _InternalHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server.server_address[1]
+
+
 def main() -> None:
-    global AGENT_SLOTS
+    global AGENT_SLOTS, BRIDGE_INTERNAL_URL, _bots_by_token
     concurrency, bots = load_config()
     AGENT_SLOTS = threading.Semaphore(concurrency)
+    port = start_internal_server()
+    BRIDGE_INTERNAL_URL = f"http://127.0.0.1:{port}"
+    _bots_by_token = {bot.token: bot for bot in bots}
     print(
         f"Starting {len(bots)} bot(s); max {concurrency} agent(s) at once. "
-        f"opencode={OPENCODE}"
+        f"opencode={OPENCODE}  internal={BRIDGE_INTERNAL_URL}"
     )
     for bot in bots:
         ensure_shared_instructions(bot)

@@ -4,12 +4,15 @@
 Usage: chat_respond <message text>
        echo "text" | chat_respond
 
-Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from environment variables
-injected by the bridge. Useful for proactive/scheduled runs that need to send
-multiple separate messages during a single invocation.
+Routes through the bridge's internal server so that all marker processing
+(buttons, inline keyboards, file sends) works exactly as in regular replies.
+HTML formatting is supported: <b>bold</b>, <i>italic</i>, <code>code</code>.
+Markers work too: include [[buttons: A | B]] or [[inline: A | B]] in the text.
 
-Parse mode is HTML — wrap names in <b>…</b>, use &lt; and &gt; for literal
-angle brackets. Emoji work as-is.
+Environment variables injected by the bridge:
+  TELEGRAM_BOT_TOKEN    — identifies which bot is sending
+  TELEGRAM_CHAT_ID      — destination chat
+  BRIDGE_INTERNAL_URL   — http://127.0.0.1:<port> of the bridge's send endpoint
 """
 import os
 import sys
@@ -18,27 +21,35 @@ import requests
 
 
 def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    token    = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id  = os.environ.get("TELEGRAM_CHAT_ID")
+    bridge   = os.environ.get("BRIDGE_INTERNAL_URL")
+
     if not token or not chat_id:
         sys.exit("chat_respond: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 
-    if len(sys.argv) > 1:
-        text = " ".join(sys.argv[1:])
-    else:
-        text = sys.stdin.read().strip()
-
+    text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read().strip()
     if not text:
         sys.exit("chat_respond: no message text provided")
 
-    resp = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": int(chat_id), "text": text, "parse_mode": "HTML"},
-        timeout=10,
-    )
-    data = resp.json()
-    if not data.get("ok"):
-        sys.exit(f"chat_respond: Telegram error: {data}")
+    if bridge:
+        resp = requests.post(
+            f"{bridge}/send",
+            json={"token": token, "chat_id": int(chat_id), "text": text},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            sys.exit(f"chat_respond: bridge error {resp.status_code}: {resp.text[:200]}")
+    else:
+        # Fallback: direct Telegram API when bridge URL is not available
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": int(chat_id), "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            sys.exit(f"chat_respond: Telegram error: {data}")
 
 
 if __name__ == "__main__":
