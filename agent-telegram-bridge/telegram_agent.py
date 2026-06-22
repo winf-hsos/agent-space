@@ -21,10 +21,16 @@ Setup:
   3. pip install -r requirements.txt
   4. Edit agents.yaml, then run:  python telegram_agent.py
 
-Env vars:
-  <token_env>    - one per agent, named in agents.yaml (e.g. TELEGRAM_BOT_TOKEN)
-  AGENTS_CONFIG  - optional, path to the YAML config (default: agents.yaml next to this file)
-  OPENCODE_BIN  - optional, explicit path to the opencode executable
+Env vars (user-set):
+  <token_env>           - one per agent, named in agents.yaml
+  AGENTS_CONFIG         - optional, path to agents.yaml (default: next to this file)
+  OPENCODE_BIN          - optional, explicit path to opencode executable
+  BRIDGE_INTERNAL_PORT  - optional, port for internal HTTP server (default: 7861)
+
+Env vars injected into agent subprocesses:
+  TELEGRAM_CHAT_ID      - current chat ID
+  TELEGRAM_BOT_TOKEN    - this bot's token (for chat_respond)
+  BRIDGE_INTERNAL_URL   - http://127.0.0.1:<port> (for chat_respond routing)
 """
 
 import ast
