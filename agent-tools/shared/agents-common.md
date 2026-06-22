@@ -149,6 +149,61 @@ Treat these exactly like the natural-language equivalent: parse the arguments,
 call the appropriate tool, confirm in one short sentence. If the arguments are
 missing or malformed, ask for clarification rather than guessing.
 
+## Multi-step tasks that need user input mid-way
+
+Some tasks require asking Nicolas a question, waiting for his answer, then
+continuing — possibly several times. Use `task_pause` to put yourself to sleep
+between turns without losing track of what you were doing.
+
+### How it works
+
+1. Do whatever work you can without the missing information.
+2. Save your progress with `task_pause`:
+   ```sh
+   task_pause "Adding 7 items. Done: Butter→Combi. Pending: Eier, Äpfel, Reis, Mehl, Zucker, Toilettenpapier. Currently asking: which store for Eier?"
+   ```
+3. Ask the question with `chat_respond` (with inline buttons if appropriate).
+4. Exit — your run is complete for this turn.
+
+The bridge saves your state. On Nicolas's next reply, it automatically prepends
+a `[TASK IN PROGRESS]` block to your prompt so you wake up knowing exactly where
+you left off. His reply follows immediately after.
+
+5. Process his answer, do the next step, then either:
+   - Call `task_pause` again with updated state and ask the next question, or
+   - Call `task_pause --done` and confirm everything is finished.
+
+### Example — adding items with unknown stores
+
+```sh
+# Turn 1: process known items, hit first unknown
+food-add "Butter"          # unknown → needs store
+task_pause "Adding: Butter, Eier, Äpfel. Done: none. Pending: Butter, Eier, Äpfel. Asking: store for Butter?"
+chat_respond "Bei welchem Geschäft kaufst du <b>Butter</b>? [[inline: 🛒 Combi | 🚴 Picnic | 🏪 Markt]]"
+
+# Turn 2: wakes with [TASK IN PROGRESS] + "Picnic"
+food-add "Butter" Picnic
+task_pause "Adding: Butter, Eier, Äpfel. Done: Butter→Picnic. Pending: Eier, Äpfel. Asking: store for Eier?"
+chat_respond "Und <b>Eier</b>? [[inline: 🛒 Combi | 🚴 Picnic | 🏪 Markt]]"
+
+# Turn 3: wakes with [TASK IN PROGRESS] + "Combi"
+food-add "Eier" Combi
+food-add "Äpfel"           # this one is in the catalog already → succeeds
+task_pause --done
+chat_respond "Alles hinzugefügt: <b>Butter</b> (Picnic), <b>Eier</b> (Combi), <b>Äpfel</b>."
+```
+
+### Rules
+
+- Always call `task_pause` **before** `chat_respond` when pausing — the state
+  must be saved before you ask the question.
+- Keep the state text factual: what was requested, what's done, what's pending,
+  what you just asked. Write it so your future self can act on it without
+  re-reading the conversation.
+- Call `task_pause --done` as soon as the task is complete, before confirming.
+- If Nicolas says something unrelated mid-task, use your judgement: either ask
+  if he wants to abort ("Soll ich die Aufgabe abbrechen?") or handle both.
+
 ## Proactive (scheduled) messages
 
 Sometimes you are run automatically on a schedule rather than in reply to a

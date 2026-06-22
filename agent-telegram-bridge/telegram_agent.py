@@ -556,6 +556,16 @@ def worker(bot: Bot) -> None:
                     except Exception as e:
                         print(f"[{bot.name}] download failed:", e)
                 prompt = build_prompt(text, files)
+                # Resume a paused multi-step task if the agent saved state.
+                if not proactive:
+                    task_file = bot.workdir / f".task_{chat_id}"
+                    if task_file.exists():
+                        task_state = task_file.read_text(encoding="utf-8").strip()
+                        if task_state:
+                            prompt = (
+                                f"[TASK IN PROGRESS]\n{task_state}\n\n"
+                                f"[USER REPLIED]\n{prompt}"
+                            )
                 history = read_history(bot, chat_id, bot.history)
                 if history:
                     prompt = history_block(history) + "\n\n" + prompt
