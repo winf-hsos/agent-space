@@ -158,7 +158,8 @@ def extract_answer(stdout: str) -> str:
 
 def run_agent(workdir: Path, keep_context: bool, prompt: str,
               model: str | None = None, timeout: int = RUN_TIMEOUT,
-              chat_id: int | None = None) -> str:
+              chat_id: int | None = None,
+              token: str | None = None) -> str:
     """Run one prompt through the opencode CLI and return only the final answer."""
     if OPENCODE is None:
         return "opencode CLI not found on PATH. Run: npm install -g opencode-ai"
@@ -184,6 +185,8 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
         env["PATH"] = os.pathsep.join(tool_dirs) + os.pathsep + env.get("PATH", "")
     if chat_id is not None:
         env["TELEGRAM_CHAT_ID"] = str(chat_id)
+    if token is not None:
+        env["TELEGRAM_BOT_TOKEN"] = token
     try:
         result = subprocess.run(
             cmd,
@@ -545,12 +548,15 @@ def worker(bot: Bot) -> None:
                     reply = run_agent(
                         bot.workdir, bot.keep_context, prompt,
                         model=bot.model, timeout=bot.timeout, chat_id=chat_id,
+                        token=bot.token,
                     )
             clean, to_send = split_outgoing(reply, bot.workdir)
             clean, button_labels = split_buttons(clean)
             clean, inline_labels = split_inline(clean)
             clean, kbd = split_keyboard(clean)
-            if clean:
+            # For proactive (cron) runs, the agent may use the `chat_respond` tool
+            # to send messages directly — suppress the empty fallback in that case.
+            if clean and not (proactive and clean == "(no output)"):
                 send(bot.api, chat_id, clean,
                      buttons=button_labels or None,
                      inline_buttons=inline_labels or None,

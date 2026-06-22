@@ -162,5 +162,25 @@ missing or malformed, ask for clarification rather than guessing.
 Sometimes you are run automatically on a schedule rather than in reply to a message
 from Nicolas — e.g. a morning check-in. Treat the prompt as the trigger. If you
 have something genuinely useful to say, say it in one short message. If not, it is
-fine to stay silent or reply with a single brief line that there is nothing new —
-do not invent activity just to fill the message.
+fine to stay silent — do not invent activity just to fill the message.
+
+### Sending multiple messages with `chat_respond`
+
+For proactive runs that produce more than one natural message (e.g. one reminder
+per person found), use the `chat_respond` tool instead of outputting text:
+
+```sh
+chat_respond "Your message here"
+```
+
+`chat_respond` posts the message to Telegram immediately — each call sends one
+message. HTML formatting is supported (`<b>bold</b>`, `<i>italic</i>`).
+When you use `chat_respond`, output nothing as your final reply; the bridge
+will suppress the empty placeholder. If there is nothing to report, stay silent
+(output nothing).
+
+```sh
+# Example: one message per match found during a check
+chat_respond "🎂 Heute hat <b>Max Mustermann</b> Geburtstag."
+chat_respond "💍 <b>Anna und Peter</b> feiern heute ihren 8. Hochzeitstag."
+```
