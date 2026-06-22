@@ -79,6 +79,11 @@ REMINDER_PREFIX = "Erinnerung"  # bold label prepended to delivered reminders
 HISTORY_DIR = BRIDGE_DIR / "history"  # per-bot, per-chat conversation logs
 HISTORY_CAP = 1000  # max lines kept on disk per chat (older lines are dropped)
 
+# Agent invocation logging. Set AGENT_LOG=1 in .env to enable.
+# Logs full prompt + raw opencode output per run to logs/<agent>.log
+AGENT_LOG = os.environ.get("AGENT_LOG", "0").strip().lower() in ("1", "true", "yes")
+AGENT_LOG_DIR = Path(os.environ.get("AGENT_LOG_DIR", BRIDGE_DIR / "logs"))
+
 # Voice transcription (OpenAI Whisper API). Needs OPENAI_API_KEY in the env.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "whisper-1")
@@ -169,10 +174,33 @@ def extract_answer(stdout: str) -> str:
     return answer
 
 
+def _log_invocation(agent_name: str, chat_id: int | None,
+                    prompt: str, stdout: str, stderr: str, duration: float) -> None:
+    """Append one agent run to logs/<agent_name>.log (no-op when AGENT_LOG is off)."""
+    if not AGENT_LOG:
+        return
+    AGENT_LOG_DIR.mkdir(exist_ok=True)
+    log_file = AGENT_LOG_DIR / f"{agent_name}.log"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bar = "=" * 72
+    with log_file.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n{bar}\n")
+        fh.write(f"{ts}  agent={agent_name}  chat={chat_id}  duration={duration:.1f}s\n")
+        fh.write(f"{bar}\n")
+        fh.write("PROMPT\n------\n")
+        fh.write(prompt.rstrip() + "\n")
+        fh.write("\nOUTPUT (raw opencode JSONL)\n---------------------------\n")
+        fh.write((stdout or "(empty)").rstrip() + "\n")
+        if stderr and stderr.strip():
+            fh.write("\nSTDERR\n------\n")
+            fh.write(stderr.strip() + "\n")
+
+
 def run_agent(workdir: Path, keep_context: bool, prompt: str,
               model: str | None = None, timeout: int = RUN_TIMEOUT,
               chat_id: int | None = None,
-              token: str | None = None) -> str:
+              token: str | None = None,
+              agent_name: str = "agent") -> str:
     """Run one prompt through the opencode CLI and return only the final answer."""
     if OPENCODE is None:
         return "opencode CLI not found on PATH. Run: npm install -g opencode-ai"
@@ -202,6 +230,7 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
         env["TELEGRAM_BOT_TOKEN"] = token
     if BRIDGE_INTERNAL_URL:
         env["BRIDGE_INTERNAL_URL"] = BRIDGE_INTERNAL_URL
+    t0 = time.monotonic()
     try:
         result = subprocess.run(
             cmd,
@@ -214,7 +243,11 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
             env=env,
         )
     except subprocess.TimeoutExpired:
+        _log_invocation(agent_name, chat_id, prompt, "", "", time.monotonic() - t0)
         return f"Agent timed out after {timeout}s."
+    _log_invocation(agent_name, chat_id, prompt,
+                    result.stdout or "", result.stderr or "",
+                    time.monotonic() - t0)
     answer = extract_answer(result.stdout or "")
     if answer:
         return answer
@@ -573,7 +606,7 @@ def worker(bot: Bot) -> None:
                     reply = run_agent(
                         bot.workdir, bot.keep_context, prompt,
                         model=bot.model, timeout=bot.timeout, chat_id=chat_id,
-                        token=bot.token,
+                        token=bot.token, agent_name=bot.name,
                     )
             # Agents send all messages via chat_respond — final text is discarded.
             # [[send: path]] markers are still honoured for file delivery.
