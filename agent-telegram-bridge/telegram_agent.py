@@ -91,10 +91,6 @@ AGENT_SLOTS = threading.Semaphore(1)
 INTERNAL_PORT = int(os.environ.get("BRIDGE_INTERNAL_PORT", "7861"))
 BRIDGE_INTERNAL_URL: str | None = None  # set in main() after server starts
 _bots_by_token: dict = {}               # token → Bot, populated in main()
-# Tracks whether chat_respond was called during the current agent run.
-# Key: (token, chat_id). Worker clears before each run; handler sets on send.
-_chat_responded: dict = {}
-_chat_responded_lock = threading.Lock()
 
 
 def _resolve_opencode():
@@ -573,29 +569,15 @@ def worker(bot: Bot) -> None:
                 history = read_history(bot, chat_id, bot.history)
                 if history:
                     prompt = history_block(history) + "\n\n" + prompt
-                with _chat_responded_lock:
-                    _chat_responded[(bot.token, chat_id)] = False
                 with AGENT_SLOTS:  # global cap: at most N agents running at once
                     reply = run_agent(
                         bot.workdir, bot.keep_context, prompt,
                         model=bot.model, timeout=bot.timeout, chat_id=chat_id,
                         token=bot.token,
                     )
-            # Prefer chat_respond for sending (routes through bridge, supports
-            # markers, works for proactive runs). Fall back to the final text
-            # output only if chat_respond was never called this run — this keeps
-            # agents that haven't adopted chat_respond working transparently.
-            clean, to_send = split_outgoing(reply, bot.workdir)
-            clean, button_labels = split_buttons(clean)
-            clean, inline_labels = split_inline(clean)
-            clean, kbd = split_keyboard(clean)
-            with _chat_responded_lock:
-                used_chat_respond = _chat_responded.get((bot.token, chat_id), False)
-            if clean and not used_chat_respond and not proactive:
-                send(bot.api, chat_id, clean,
-                     buttons=button_labels or None,
-                     inline_buttons=inline_labels or None,
-                     reply_keyboard=kbd)
+            # Agents send all messages via chat_respond — final text is discarded.
+            # [[send: path]] markers are still honoured for file delivery.
+            _, to_send = split_outgoing(reply, bot.workdir)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
             # Record the exchange for future context (no-op if history disabled).
@@ -1715,8 +1697,6 @@ class _InternalHandler(BaseHTTPRequestHandler):
                      reply_keyboard=kbd)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
-            with _chat_responded_lock:
-                _chat_responded[(token, chat_id)] = True
         except Exception as e:
             print(f"[internal] send error: {e}")
             self.send_response(500)
