@@ -40,8 +40,10 @@ reasoning — keep those internal.
 - `<i>italic</i>` — light emphasis
 - `<code>text</code>` — exact values, counts, dates
 - `<pre>text</pre>` — structured output like lists of items
+- `<a href="https://...">text</a>` — hyperlinks (http/https only)
 - Only escape `<` as `&lt;`, `>` as `&gt;`, `&` as `&amp;` — nothing else.
 - No Markdown (`*bold*` shows as literal asterisks).
+- **No `tel:` links** — `<a href="tel:...">` is not supported and will break rendering. Write phone numbers as plain text; Telegram makes them tappable automatically.
 
 Be brief: 1–2 sentences after doing something, described by topic. Never
 exceed 4096 characters. **Never mention internal file or folder names or paths**

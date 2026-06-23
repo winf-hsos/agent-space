@@ -274,6 +274,12 @@ def send(api: str, chat_id: int, text: str, parse_mode: str | None = "HTML",
     reply_keyboard sets/replaces the persistent bottom keyboard; pass 'remove' to dismiss it.
     """
     text = text or "(no output)"
+    # Strip unsupported <a href="tel:..."> links — Telegram only accepts http/https.
+    # Replace with the visible link text so the number still appears.
+    text = re.sub(
+        r'<a\s+href=["\']tel:[^"\']*["\'][^>]*>(.*?)</a>',
+        r'\1', text, flags=re.IGNORECASE | re.DOTALL
+    )
     reply_markup = None
     if inline_buttons:
         # All labels in a single row; callback_data prefixed so poller can route them.
