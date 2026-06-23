@@ -96,6 +96,7 @@ AGENT_SLOTS = threading.Semaphore(1)
 INTERNAL_PORT = int(os.environ.get("BRIDGE_INTERNAL_PORT", "7861"))
 BRIDGE_INTERNAL_URL: str | None = None  # set in main() after server starts
 _bots_by_token: dict = {}               # token → Bot, populated in main()
+_history_lock = threading.Lock()        # serialises all history file writes
 
 
 def _resolve_opencode():
@@ -410,11 +411,12 @@ def log_turn(bot: "Bot", chat_id: int, user_text, agent_text) -> None:
         return
     HISTORY_DIR.mkdir(exist_ok=True)
     p = history_path(bot, chat_id)
-    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
-    lines += [json.dumps(e, ensure_ascii=False) for e in entries]
-    if len(lines) > HISTORY_CAP:
-        lines = lines[-HISTORY_CAP:]
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with _history_lock:
+        lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+        lines += [json.dumps(e, ensure_ascii=False) for e in entries]
+        if len(lines) > HISTORY_CAP:
+            lines = lines[-HISTORY_CAP:]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def history_block(entries: list) -> str:
@@ -1704,6 +1706,7 @@ class _InternalHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        clean = ""
         try:
             chat_id = int(chat_id)
             clean, to_send = split_outgoing(text, bot.workdir)
@@ -1715,7 +1718,6 @@ class _InternalHandler(BaseHTTPRequestHandler):
                      buttons=button_labels or None,
                      inline_buttons=inline_labels or None,
                      reply_keyboard=kbd)
-                log_turn(bot, chat_id, None, clean)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
         except Exception as e:
@@ -1723,6 +1725,14 @@ class _InternalHandler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             return
+
+        # Log after confirming delivery — separate try so a logging failure
+        # never causes a 500 that would break chat_respond in the agent.
+        if clean:
+            try:
+                log_turn(bot, chat_id, None, clean)
+            except Exception as e:
+                print(f"[internal] log error: {e}")
 
         self.send_response(200)
         self.end_headers()
