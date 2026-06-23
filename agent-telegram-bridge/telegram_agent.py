@@ -592,6 +592,10 @@ def worker(bot: Bot) -> None:
                 history = read_history(bot, chat_id, bot.history)
                 if history:
                     prompt = history_block(history) + "\n\n" + prompt
+                # Log the user message before the run so it precedes agent replies.
+                if not proactive:
+                    user_log = text or ("[sent a file]" if attachments else None)
+                    log_turn(bot, chat_id, user_log, None)
                 with AGENT_SLOTS:  # global cap: at most N agents running at once
                     reply = run_agent(
                         bot.workdir, bot.keep_context, prompt,
@@ -603,13 +607,6 @@ def worker(bot: Bot) -> None:
             _, to_send = split_outgoing(reply, bot.workdir)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
-            # Record the exchange for future context (no-op if history disabled).
-            # Proactive (cron) runs log only the agent's message, not their prompt.
-            if proactive:
-                user_log = None
-            else:
-                user_log = text or ("[sent a file]" if attachments else None)
-            log_turn(bot, chat_id, user_log, None)
         except Exception as e:  # never let one bad message kill the worker
             print(f"[{bot.name}] worker error:", e)
             try:
@@ -1718,6 +1715,7 @@ class _InternalHandler(BaseHTTPRequestHandler):
                      buttons=button_labels or None,
                      inline_buttons=inline_labels or None,
                      reply_keyboard=kbd)
+                log_turn(bot, chat_id, None, clean)
             for path in to_send:
                 send_file(bot.api, chat_id, path)
         except Exception as e:
