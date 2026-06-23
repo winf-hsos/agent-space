@@ -21,6 +21,15 @@ Use `chat_respond` to send every message to Nicolas:
 chat_respond "Your message here"
 ```
 
+For multi-line messages, use `\n` as a literal escape sequence inside the
+quoted string — **never** embed actual newlines in the command. The tool
+converts `\n` to real line breaks automatically:
+
+```sh
+chat_respond "Line 1\nLine 2\nLine 3"
+chat_respond "<b>Name:</b> Julia\n<b>Birthday:</b> 20.02.1984"
+```
+
 Your text output is **discarded** — only `chat_respond` calls reach him. Write
 for chat, not a terminal. Send **only your final answer**: do the work first,
 then call `chat_respond` once with the conclusion. Do not narrate steps or
