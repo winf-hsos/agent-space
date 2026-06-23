@@ -29,6 +29,9 @@ def main() -> None:
         sys.exit("chat_respond: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 
     text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read().strip()
+    # Shell double-quotes don't expand \n — convert escape sequences so the
+    # agent can write multi-line messages naturally without $'...' syntax.
+    text = text.replace("\\n", "\n").replace("\\t", "\t")
     if not text:
         sys.exit("chat_respond: no message text provided")
 
