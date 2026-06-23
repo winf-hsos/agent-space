@@ -418,7 +418,7 @@ def log_turn(bot: "Bot", chat_id: int, user_text, agent_text) -> None:
 
 
 def history_block(entries: list) -> str:
-    """Format logged messages as a context preamble for the prompt."""
+    """Format logged messages as the full prompt for the agent."""
     if not entries:
         return ""
     body = "\n".join(
@@ -426,8 +426,7 @@ def history_block(entries: list) -> str:
         for e in entries
     )
     return (
-        "[Recent chat history with the user, oldest first, for context only. "
-        "Do not respond to these old messages -- only to the new message below.]\n"
+        "[Conversation history, oldest first. Respond to the last User message.]\n"
         f"{body}\n[End of history]"
     )
 
@@ -589,13 +588,14 @@ def worker(bot: Bot) -> None:
                     except Exception as e:
                         print(f"[{bot.name}] download failed:", e)
                 prompt = build_prompt(text, files)
+                # Log user message first so it's included when history is read.
+                if not proactive:
+                    log_turn(bot, chat_id, prompt, None)
                 history = read_history(bot, chat_id, bot.history)
                 if history:
-                    prompt = history_block(history) + "\n\n" + prompt
-                # Log the user message before the run so it precedes agent replies.
-                if not proactive:
-                    user_log = text or ("[sent a file]" if attachments else None)
-                    log_turn(bot, chat_id, user_log, None)
+                    # History now ends with the current message — use it as the
+                    # full prompt so the agent sees the complete conversation.
+                    prompt = history_block(history)
                 with AGENT_SLOTS:  # global cap: at most N agents running at once
                     reply = run_agent(
                         bot.workdir, bot.keep_context, prompt,
