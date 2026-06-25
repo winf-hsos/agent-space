@@ -1051,8 +1051,9 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
         try:
             cmd_env = os.environ.copy()
             cmd_env["PYTHONUTF8"] = "1"
+            extra_args = text.strip().split()[1:]
             result = subprocess.run(
-                [sys.executable, str(cmd_script)],
+                [sys.executable, str(cmd_script)] + extra_args,
                 capture_output=True, env=cmd_env,
                 cwd=bot.workdir, timeout=10,
             )
