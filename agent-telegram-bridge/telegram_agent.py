@@ -75,8 +75,6 @@ SHARED_INSTRUCTIONS = TOOLS_DIR / "shared" / "agents-common.md"
 TELEGRAM_LIMIT = 4096
 RUN_TIMEOUT = 600  # seconds an agent may work on a single message
 REMINDER_PREFIX = "Erinnerung"  # bold label prepended to delivered reminders
-HISTORY_DIR = BRIDGE_DIR / "history"  # per-bot, per-chat conversation logs
-HISTORY_CAP = 1000  # max lines kept on disk per chat (older lines are dropped)
 
 # Agent invocation logging. Set AGENT_LOG=1 in .env to enable.
 # Logs full prompt + raw opencode output per run to logs/<agent>.log
@@ -380,7 +378,7 @@ def transcribe(path: Path) -> str:
 
 
 def history_path(bot: "Bot", chat_id: int) -> Path:
-    return HISTORY_DIR / f"{bot.name}_{chat_id}.jsonl"
+    return bot.workdir / "history" / f"{chat_id}.jsonl"
 
 
 def read_history(bot: "Bot", chat_id: int, n: int) -> list:
@@ -403,8 +401,7 @@ def log_turn(bot: "Bot", chat_id: int, user_text, agent_text) -> None:
     """Append a user message and/or agent reply to this chat's history file.
 
     No-op unless the bot has history enabled. Either side may be empty (e.g. a
-    proactive run logs only the agent's message). The file is trimmed to the last
-    HISTORY_CAP lines so it can't grow without bound.
+    proactive run logs only the agent's message).
     """
     if bot.history <= 0:
         return
@@ -416,14 +413,12 @@ def log_turn(bot: "Bot", chat_id: int, user_text, agent_text) -> None:
         entries.append({"t": now, "role": "agent", "text": agent_text.strip()})
     if not entries:
         return
-    HISTORY_DIR.mkdir(exist_ok=True)
     p = history_path(bot, chat_id)
     with _history_lock:
-        lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
-        lines += [json.dumps(e, ensure_ascii=False) for e in entries]
-        if len(lines) > HISTORY_CAP:
-            lines = lines[-HISTORY_CAP:]
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        p.parent.mkdir(exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
 
 
 def history_block(entries: list) -> str:

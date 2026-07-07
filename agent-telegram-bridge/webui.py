@@ -30,7 +30,6 @@ _agents_dir_env = os.environ.get("AUTO_UPDATE_AGENTS_DIR", "")
 MY_AGENTS_DIR: Optional[Path] = Path(_agents_dir_env) if _agents_dir_env else None
 CONFIG_PATH = BRIDGE_DIR / "agents.yaml"
 ENV_PATH = BRIDGE_DIR / ".env"
-HISTORY_DIR = BRIDGE_DIR / "history"
 TOOLS_DIR = Path(os.environ.get("AGENT_TOOLS_DIR", BRIDGE_DIR.parent / "agent-tools")).resolve()
 SHARED_INSTRUCTIONS_PATH = TOOLS_DIR / "shared" / "agents-common.md"
 AUTO_UPDATE_INTERVAL = int(os.environ.get("AUTO_UPDATE_INTERVAL", "0"))  # 0 = disabled
@@ -196,13 +195,12 @@ def _set_env(key: str, value: str) -> None:
 
 # ── History ────────────────────────────────────────────────────────────────────
 
-def _list_chats(bot_name: str) -> list[dict]:
-    if not HISTORY_DIR.exists():
+def _list_chats(workdir: str) -> list[dict]:
+    hist_dir = Path(workdir) / "history"
+    if not hist_dir.exists():
         return []
-    prefix = f"{bot_name}_"
     results = []
-    for f in HISTORY_DIR.glob(f"{prefix}*.jsonl"):
-        chat_id = f.stem[len(prefix):]
+    for f in hist_dir.glob("*.jsonl"):
         lines = f.read_text(encoding="utf-8").strip().splitlines()
         last_t: Optional[int] = None
         if lines:
@@ -210,13 +208,13 @@ def _list_chats(bot_name: str) -> list[dict]:
                 last_t = json.loads(lines[-1]).get("t")
             except Exception:
                 pass
-        results.append({"chat_id": chat_id, "count": len(lines), "last_t": last_t})
+        results.append({"chat_id": f.stem, "count": len(lines), "last_t": last_t})
     results.sort(key=lambda x: x["last_t"] or 0, reverse=True)
     return results
 
 
-def _read_history(bot_name: str, chat_id: str, limit: int = 300) -> list[dict]:
-    path = HISTORY_DIR / f"{bot_name}_{chat_id}.jsonl"
+def _read_history(workdir: str, chat_id: str, limit: int = 300) -> list[dict]:
+    path = Path(workdir) / "history" / f"{chat_id}.jsonl"
     if not path.exists():
         return []
     lines = path.read_text(encoding="utf-8").strip().splitlines()
@@ -341,7 +339,7 @@ async def dashboard(request: Request):
     cfg = _load_raw()
     bots_view = []
     for bot in cfg.get("agents", []):
-        chats = _list_chats(bot["name"])
+        chats = _list_chats(bot["workdir"])
         reminders = _list_reminders(bot)
         bots_view.append({
             **bot,
@@ -458,14 +456,14 @@ async def bot_detail(request: Request, name: str, tab: str = "overview", chat_id
     bot = _find_bot(cfg, name)
     if not bot:
         raise HTTPException(404, f"Agent '{name}' not found")
-    chats = _list_chats(name)
+    chats = _list_chats(bot["workdir"])
     reminders = _list_reminders(bot)
     agents_md_path = Path(bot["workdir"]) / "AGENTS.md"
     agents_md = agents_md_path.read_text(encoding="utf-8") if agents_md_path.exists() else ""
     selected_chat = chat_id or (chats[0]["chat_id"] if chats else "")
     history_entries: list[dict] = []
     if selected_chat and tab == "history":
-        history_entries = _read_history(name, selected_chat)
+        history_entries = _read_history(bot["workdir"], selected_chat)
     return templates.TemplateResponse(request, "agent_detail.html", {
         "agent": bot,
         "tab": tab,
@@ -601,7 +599,11 @@ async def delete_schedule(name: str, idx: int):
 
 @app.get("/api/agents/{name}/history/{chat_id}")
 async def api_history(name: str, chat_id: str):
-    return JSONResponse({"entries": _read_history(name, chat_id)})
+    cfg = _load_raw()
+    bot = _find_bot(cfg, name)
+    if not bot:
+        raise HTTPException(404)
+    return JSONResponse({"entries": _read_history(bot["workdir"], chat_id)})
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
