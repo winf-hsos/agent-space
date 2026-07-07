@@ -196,7 +196,7 @@
         <div class="flex {% if e.role == 'user' %}justify-start{% else %}justify-end{% endif %}">
           <div class="max-w-[78%] rounded-2xl px-4 py-2.5 text-sm
                       {% if e.role == 'user' %}bg-slate-800 text-slate-200 rounded-tl-sm{% else %}bg-indigo-900 text-indigo-100 rounded-tr-sm{% endif %}">
-            <p class="text-xs opacity-50 mb-1">{{ 'You' if e.role == 'user' else 'Agent' }} · {{ e.t | fmt_ts }}</p>
+            <p class="text-xs opacity-50 mb-1">{{ 'User' if e.role == 'user' else 'Agent' }} · {{ e.t | fmt_ts }}</p>
             <p class="whitespace-pre-wrap leading-relaxed">{{ e.text }}</p>
           </div>
         </div>
@@ -232,7 +232,12 @@
       {% for r in reminders %}
       <tr class="border-b border-slate-800/60 hover:bg-slate-800/40" id="rem-{{ loop.index0 }}">
         <td class="px-5 py-3 font-mono text-amber-400 whitespace-nowrap">{{ r.due[:16].replace('T', ' ') }}</td>
-        <td class="px-5 py-3 text-slate-300">{{ r.text }}</td>
+        <td class="px-5 py-3 text-slate-300">
+          {% if r.get('type') == 'schedule' %}
+          <span class="text-xs px-1.5 py-0.5 rounded bg-indigo-950 text-indigo-400 mr-1.5">schedule</span>
+          {% endif %}
+          {{ r.text }}
+        </td>
         <td class="px-5 py-3 font-mono text-slate-500">{{ r.get('chat_id', '—') }}</td>
         <td class="px-5 py-3 text-right">
           <button onclick="deleteReminder('{{ r._file }}', {{ loop.index0 }})"
@@ -400,7 +405,7 @@ async function loadChat(chatId) {
     return `<div class="flex ${isUser ? 'justify-start' : 'justify-end'}">
       <div class="max-w-[78%] rounded-2xl px-4 py-2.5 text-sm
                   ${isUser ? 'bg-slate-800 text-slate-200 rounded-tl-sm' : 'bg-indigo-900 text-indigo-100 rounded-tr-sm'}">
-        <p class="text-xs opacity-50 mb-1">${isUser ? 'You' : 'Agent'} · ${dt}</p>
+        <p class="text-xs opacity-50 mb-1">${isUser ? 'User' : 'Agent'} · ${dt}</p>
         <p class="whitespace-pre-wrap leading-relaxed">${text}</p>
       </div>
     </div>`;

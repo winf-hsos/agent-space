@@ -240,6 +240,9 @@ def _list_reminders(bot: dict) -> list[dict]:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             data["_file"] = f.name
+            # Normalize: schedule entries use "prompt", reminder entries use "text"
+            if "text" not in data:
+                data["text"] = data.get("prompt", "")
             items.append(data)
         except Exception:
             pass

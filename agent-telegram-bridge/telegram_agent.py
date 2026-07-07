@@ -40,13 +40,12 @@ import json
 import os
 import queue
 import re
-import sqlite3
 import sys
 import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -436,8 +435,33 @@ def history_block(entries: list) -> str:
         for e in entries
     )
     return (
-        "[Conversation history, oldest first. Respond to the last User message.]\n"
-        f"{body}\n[End of history]"
+        "You are invoked because the user sent you a message. "
+        "The conversation history is listed below, oldest first — "
+        "the last entry is the message you should respond to.\n\n"
+        f"{body}\n"
+        "[End of conversation]"
+    )
+
+
+def scheduled_prompt(task: str, entries: list) -> str:
+    """Wrap a scheduled/proactive task with recent conversation context.
+
+    The task is the primary instruction; history is appended as read-only
+    context so the agent has situational awareness without being confused
+    about what it should do.
+    """
+    if not entries:
+        return task
+    body = "\n".join(
+        f"[{e.get('t', '')}] {'User' if e.get('role') == 'user' else 'You'}: {e.get('text', '')}"
+        for e in entries
+    )
+    return (
+        f"{task}\n\n"
+        "[Recent conversation context — for background only. "
+        "Do not reply to these messages; focus on the scheduled task above.]\n"
+        f"{body}\n"
+        "[End of context]"
     )
 
 
@@ -598,14 +622,19 @@ def worker(bot: Bot) -> None:
                     except Exception as e:
                         print(f"[{bot.name}] download failed:", e)
                 prompt = build_prompt(text, files)
-                # Log user message first so it's included when history is read.
-                if not proactive:
+                if proactive:
+                    # Scheduled/cron run: keep the task as the primary instruction
+                    # and append recent history as background context only.
+                    history = read_history(bot, chat_id, bot.history)
+                    if history:
+                        prompt = scheduled_prompt(prompt, history)
+                else:
+                    # Interactive run: log user message first so it's included
+                    # when history is read, then use history as the full prompt.
                     log_turn(bot, chat_id, prompt, None)
-                history = read_history(bot, chat_id, bot.history)
-                if history:
-                    # History now ends with the current message — use it as the
-                    # full prompt so the agent sees the complete conversation.
-                    prompt = history_block(history)
+                    history = read_history(bot, chat_id, bot.history)
+                    if history:
+                        prompt = history_block(history)
                 with _chat_responded_lock:
                     _chat_responded[(bot.token, chat_id)] = False
                 with AGENT_SLOTS:  # global cap: at most N agents running at once
@@ -642,73 +671,70 @@ def worker(bot: Bot) -> None:
             bot.queue.task_done()
 
 
-def _food_db(bot: "Bot"):
-    """Open food.db for this agent, or return None if it doesn't exist.
-    Runs schema migration on first open so new columns are always present."""
-    db_path = bot.workdir / "food.db"
-    if not db_path.exists():
+_food_lock = threading.Lock()
+
+
+def _food_active(bot: "Bot") -> bool:
+    """True if this agent uses YAML food data (stores.yaml or list.yaml present)."""
+    return (bot.workdir / "stores.yaml").exists() or (bot.workdir / "list.yaml").exists()
+
+
+def _food_load(bot: "Bot", filename: str):
+    p = bot.workdir / filename
+    if not p.exists():
         return None
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(list_items)")}
-    if "status_changed_at" not in cols:
-        conn.execute("ALTER TABLE list_items ADD COLUMN status_changed_at TEXT")
-        conn.execute("UPDATE list_items SET status_changed_at = added_at")
-        conn.commit()
-    if "quantity" not in cols:
-        conn.execute("ALTER TABLE list_items ADD COLUMN quantity TEXT")
-        conn.commit()
-    return conn
+    with p.open(encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def _active_list_id(conn) -> "int | None":
-    row = conn.execute(
-        "SELECT id FROM lists WHERE archived_at IS NULL ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    return row["id"] if row else None
+def _food_save(bot: "Bot", filename: str, data) -> None:
+    p = bot.workdir / filename
+    with p.open("w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
-def _unchecked_items(conn, list_id: int) -> list:
-    return conn.execute(
-        """SELECT li.id, li.name, li.checked, li.quantity, s.name AS store
-           FROM list_items li JOIN stores s ON li.store_id = s.id
-           WHERE li.list_id = ? AND li.checked = 0
-           ORDER BY s.name, li.name""",
-        (list_id,),
-    ).fetchall()
+def _food_stores(bot: "Bot") -> list:
+    return _food_load(bot, "stores.yaml") or []
 
 
-def _all_list_items(conn, list_id: int) -> list:
-    """Unchecked items + checked items whose status changed within the last 6 hours."""
-    return conn.execute(
-        """SELECT li.id, li.name, li.checked, li.quantity, s.name AS store
-           FROM list_items li JOIN stores s ON li.store_id = s.id
-           WHERE li.list_id = ?
-             AND (
-               li.checked = 0
-               OR datetime(COALESCE(li.status_changed_at, li.added_at))
-                  > datetime('now', '-6 hours')
-             )
-           ORDER BY li.checked, s.name, li.name""",
-        (list_id,),
-    ).fetchall()
+def _food_catalog(bot: "Bot") -> list:
+    return _food_load(bot, "catalog.yaml") or []
 
 
-def _store_list_items(conn, list_id: int, store_id: int) -> list:
-    """Unchecked + recently-checked items for one store (6-hour window for checked)."""
-    return conn.execute(
-        """SELECT li.id, li.name, li.checked, li.quantity, s.name AS store
-           FROM list_items li JOIN stores s ON li.store_id = s.id
-           WHERE li.list_id = ?
-             AND li.store_id = ?
-             AND (
-               li.checked = 0
-               OR datetime(COALESCE(li.status_changed_at, li.added_at))
-                  > datetime('now', '-6 hours')
-             )
-           ORDER BY li.checked, li.name""",
-        (list_id, store_id),
-    ).fetchall()
+def _food_list(bot: "Bot") -> "dict | None":
+    data = _food_load(bot, "list.yaml")
+    if data is not None and "items" not in data:
+        data["items"] = []
+    return data
+
+
+def _food_find(items: list, id_: int) -> "dict | None":
+    return next((x for x in items if x.get("id") == id_), None)
+
+
+def _food_active_items(lst: dict, store_id=None, hours: int = 6) -> list:
+    """Unchecked items + recently-checked items (within `hours`), optionally for one store."""
+    if not lst or not lst.get("items"):
+        return []
+    cutoff = datetime.now() - timedelta(hours=hours)
+    result = []
+    for item in lst["items"]:
+        if store_id is not None and item.get("store_id") != store_id:
+            continue
+        if item.get("checked"):
+            sc = item.get("status_changed_at")
+            if not sc or datetime.fromisoformat(sc) < cutoff:
+                continue
+        result.append(item)
+    return sorted(result, key=lambda x: (
+        x.get("checked", False), x.get("store_id", 0), x.get("name", "").lower()
+    ))
+
+
+def _food_enrich(items: list, stores: list) -> list:
+    """Add 'store' name field to each item dict."""
+    store_map = {s["id"]: s["name"] for s in stores}
+    return [{**item, "store": store_map.get(item.get("store_id"), "")} for item in items]
 
 
 def _store_picker_keyboard(stores, prefix: str = "liststore") -> dict:
@@ -729,7 +755,7 @@ def _check_keyboard(items: list) -> dict:
     """Inline keyboard for a single-store list: one item per row, toggle on tap."""
     rows = []
     for r in items:
-        qty = f" · {r['quantity']}" if r["quantity"] else ""
+        qty = f" · {r['qty']}" if r.get("qty") else ""
         if r["checked"]:
             text = f"✅ {r['name']}{qty}"
             data = f"uncheck:{r['id']}"
@@ -745,8 +771,8 @@ def _check_all_keyboard(items: list) -> dict:
     Uses checkall:/uncheckall: prefixes so the callback rebuilds the full list."""
     rows = []
     for r in items:
-        qty = f" · {r['quantity']}" if r["quantity"] else ""
-        store = f" · {r['store']}" if r["store"] else ""
+        qty = f" · {r['qty']}" if r.get("qty") else ""
+        store = f" · {r['store']}" if r.get("store") else ""
         if r["checked"]:
             text = f"✅ {r['name']}{qty}{store}"
             data = f"uncheckall:{r['id']}"
@@ -814,76 +840,43 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/list":
+        if not _food_active(bot):
+            return False
         parts = text.strip().split(None, 1)
         store_filter = parts[1].strip() if len(parts) > 1 else None
-        conn = _food_db(bot)
-        if conn is not None:
-            try:
-                list_id = _active_list_id(conn)
-                if not list_id:
-                    conn.close()
-                    send(bot.api, chat_id, "Die Einkaufsliste ist leer\\.", parse_mode="MarkdownV2")
+        try:
+            stores = _food_stores(bot)
+            lst = _food_list(bot)
+            if not lst:
+                send(bot.api, chat_id, "Die Einkaufsliste ist leer.")
+                return True
+            if store_filter:
+                store = next((s for s in stores if s["name"].lower() == store_filter.lower()), None)
+                if not store:
+                    send(bot.api, chat_id, f"Geschäft <b>{html.escape(store_filter)}</b> nicht gefunden.", parse_mode="HTML")
                     return True
-                if store_filter:
-                    store_row = conn.execute(
-                        "SELECT id, name FROM stores WHERE name = ? COLLATE NOCASE",
-                        (store_filter,)
-                    ).fetchone()
-                    if not store_row:
-                        conn.close()
-                        send(bot.api, chat_id, f"Geschäft *{store_filter}* nicht gefunden\\.", parse_mode="MarkdownV2")
-                        return True
-                    items = _store_list_items(conn, list_id, store_row["id"])
-                    conn.close()
-                    if not items:
-                        send(bot.api, chat_id, f"Nichts auf der Liste für *{store_filter}*\\.", parse_mode="MarkdownV2")
-                    else:
-                        requests.post(f"{bot.api}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": f"{store_row['name']} — antippen zum Ab- oder Abhaken:",
-                            "reply_markup": _check_keyboard(items),
-                        }, timeout=30)
+                items = _food_enrich(_food_active_items(lst, store_id=store["id"]), stores)
+                if not items:
+                    send(bot.api, chat_id, f"Nichts auf der Liste für <b>{html.escape(store['name'])}</b>.", parse_mode="HTML")
                 else:
-                    # No store arg: show store picker for stores with unchecked items
-                    stores = conn.execute(
-                        """SELECT DISTINCT s.id, s.name
-                           FROM stores s
-                           JOIN list_items li ON li.store_id = s.id
-                           WHERE li.list_id = ? AND li.checked = 0
-                           ORDER BY s.name""",
-                        (list_id,)
-                    ).fetchall()
-                    conn.close()
-                    if not stores:
-                        send(bot.api, chat_id, "Die Einkaufsliste ist leer\\.", parse_mode="MarkdownV2")
-                    else:
-                        requests.post(f"{bot.api}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": "Welches Geschäft?",
-                            "reply_markup": _store_picker_keyboard(stores),
-                        }, timeout=30)
-            except Exception as e:
-                conn.close()
-                send(bot.api, chat_id, f"Einkaufsliste konnte nicht gelesen werden: {e}")
-            return True
-        # Markdown fallback (legacy, non-food agents)
-        list_path = bot.workdir / "shopping" / "current.md"
-        if not list_path.exists():
-            return False
-        lines = list_path.read_text(encoding="utf-8").splitlines()
-        out = []
-        for line in lines:
-            if line.startswith("# "):
-                out.append(line[2:])
-            elif line.startswith("## "):
-                out.append(f"\n{line[3:]}:")
-            elif line.startswith("- [ ] "):
-                out.append(f"• {line[6:]}")
-            elif line.startswith("- [x] ") or line.startswith("- [X] "):
-                out.append(f"✓ {line[6:]}")
-            elif line.strip() and not line.startswith("_"):
-                out.append(line)
-        send(bot.api, chat_id, "\n".join(out).strip() or "Die Einkaufsliste ist leer.")
+                    requests.post(f"{bot.api}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": f"{store['name']} — antippen zum Ab- oder Abhaken:",
+                        "reply_markup": _check_keyboard(items),
+                    }, timeout=30)
+            else:
+                unchecked_store_ids = {i["store_id"] for i in lst.get("items", []) if not i.get("checked")}
+                picker_stores = sorted([s for s in stores if s["id"] in unchecked_store_ids], key=lambda s: s["name"])
+                if not picker_stores:
+                    send(bot.api, chat_id, "Die Einkaufsliste ist leer.")
+                else:
+                    requests.post(f"{bot.api}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": "Welches Geschäft?",
+                        "reply_markup": _store_picker_keyboard(picker_stores),
+                    }, timeout=30)
+        except Exception as e:
+            send(bot.api, chat_id, f"Einkaufsliste konnte nicht gelesen werden: {e}")
         return True
 
     if cmd == "/reminders":
@@ -944,21 +937,16 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/clear_list":
-        conn = _food_db(bot)
-        if conn is None:
+        if not _food_active(bot):
             return False
         try:
-            list_id = _active_list_id(conn)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM list_items WHERE list_id=?", (list_id,)
-            ).fetchone()[0] if list_id else 0
-            conn.close()
+            lst = _food_list(bot)
+            count = len(lst.get("items", [])) if lst else 0
         except Exception as e:
-            conn.close()
             send(bot.api, chat_id, f"Fehler: {e}")
             return True
         if not count:
-            send(bot.api, chat_id, "Die Einkaufsliste ist bereits leer\\.", parse_mode="MarkdownV2")
+            send(bot.api, chat_id, "Die Einkaufsliste ist bereits leer.")
             return True
         requests.post(f"{bot.api}/sendMessage", json={
             "chat_id": chat_id,
@@ -971,14 +959,11 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/stores":
-        conn = _food_db(bot)
-        if conn is None:
+        if not _food_active(bot):
             return False
         try:
-            stores = conn.execute("SELECT id, name FROM stores ORDER BY name").fetchall()
-            conn.close()
+            stores = sorted(_food_stores(bot), key=lambda s: s["name"])
         except Exception as e:
-            conn.close()
             send(bot.api, chat_id, f"Fehler: {e}")
             return True
         if not stores:
@@ -992,56 +977,41 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/catalog":
+        if not _food_active(bot):
+            return False
         parts = text.strip().split(None, 1)
         store_filter = parts[1].strip() if len(parts) > 1 else None
-        conn = _food_db(bot)
-        if conn is None:
-            return False
         try:
-            list_id = _active_list_id(conn)
-            on_list: set = set()
-            if list_id:
-                on_list = {r["name"].lower() for r in conn.execute(
-                    "SELECT name FROM list_items WHERE list_id = ? AND checked = 0", (list_id,)
-                ).fetchall()}
+            stores  = _food_stores(bot)
+            catalog = _food_catalog(bot)
+            lst = _food_list(bot)
+            on_list: set = {i["name"].lower() for i in (lst.get("items", []) if lst else []) if not i.get("checked")}
             if store_filter:
-                store_row = conn.execute(
-                    "SELECT id, name FROM stores WHERE name = ? COLLATE NOCASE", (store_filter,)
-                ).fetchone()
-                if not store_row:
-                    conn.close()
-                    send(bot.api, chat_id, f"Geschäft *{store_filter}* nicht gefunden\\.", parse_mode="MarkdownV2")
+                store = next((s for s in stores if s["name"].lower() == store_filter.lower()), None)
+                if not store:
+                    send(bot.api, chat_id, f"Geschäft <b>{html.escape(store_filter)}</b> nicht gefunden.", parse_mode="HTML")
                     return True
-                products = conn.execute(
-                    "SELECT p.id, p.name FROM products p WHERE p.store_id = ? ORDER BY p.name",
-                    (store_row["id"],)
-                ).fetchall()
-                conn.close()
+                products = sorted([p for p in catalog if p.get("store_id") == store["id"]], key=lambda p: p["name"])
                 if not products:
-                    send(bot.api, chat_id, f"Keine Produkte für *{store_row['name']}* im Katalog\\.", parse_mode="MarkdownV2")
+                    send(bot.api, chat_id, f"Keine Produkte für <b>{html.escape(store['name'])}</b> im Katalog.", parse_mode="HTML")
                     return True
                 requests.post(f"{bot.api}/sendMessage", json={
                     "chat_id": chat_id,
-                    "text": f"Katalog — {store_row['name']}:",
+                    "text": f"Katalog — {store['name']}:",
                     "reply_markup": _catalog_keyboard(products, on_list),
                 }, timeout=30)
             else:
-                stores = conn.execute(
-                    """SELECT DISTINCT s.id, s.name FROM stores s
-                       JOIN products p ON p.store_id = s.id
-                       ORDER BY s.name"""
-                ).fetchall()
-                conn.close()
-                if not stores:
-                    send(bot.api, chat_id, "Noch keine Produkte im Katalog\\.", parse_mode="MarkdownV2")
+                catalog_store_ids = {p.get("store_id") for p in catalog}
+                picker_stores = sorted([s for s in stores if s["id"] in catalog_store_ids], key=lambda s: s["name"])
+                if not picker_stores:
+                    send(bot.api, chat_id, "Noch keine Produkte im Katalog.")
                     return True
                 requests.post(f"{bot.api}/sendMessage", json={
                     "chat_id": chat_id,
                     "text": "Welches Geschäft?",
-                    "reply_markup": _store_picker_keyboard(stores, prefix="catstore"),
+                    "reply_markup": _store_picker_keyboard(picker_stores, prefix="catstore"),
                 }, timeout=30)
         except Exception as e:
-            conn.close()
             send(bot.api, chat_id, f"Fehler: {e}")
         return True
 
@@ -1111,286 +1081,149 @@ def poller(bot: Bot) -> None:
                 elif data.startswith("cat:"):
                     try:
                         product_id = int(data.split(":")[1])
-                        conn = _food_db(bot)
-                        if conn:
-                            product = conn.execute(
-                                """SELECT p.id, p.name, p.store_id
-                                   FROM products p WHERE p.id = ?""",
-                                (product_id,)
-                            ).fetchone()
-                            if product:
-                                list_id = _active_list_id(conn)
-                                already = False
-                                if list_id:
-                                    existing = conn.execute(
-                                        "SELECT id, checked FROM list_items WHERE list_id=? AND name=? COLLATE NOCASE",
-                                        (list_id, product["name"])
-                                    ).fetchone()
-                                    now = datetime.now().isoformat(timespec="seconds")
-                                    if not existing:
-                                        conn.execute(
-                                            "INSERT INTO list_items"
-                                            " (list_id, name, store_id, checked, added_at, status_changed_at)"
-                                            " VALUES (?,?,?,0,?,?)",
-                                            (list_id, product["name"], product["store_id"], now, now),
-                                        )
-                                        conn.commit()
-                                        toast = f"{product['name']} hinzugefügt ✅"
-                                    elif existing["checked"]:
-                                        conn.execute(
-                                            "UPDATE list_items SET checked=0, status_changed_at=? WHERE id=?",
-                                            (now, existing["id"]),
-                                        )
-                                        conn.commit()
-                                        toast = f"{product['name']} hinzugefügt ✅"
-                                    else:
-                                        conn.execute("DELETE FROM list_items WHERE id=?", (existing["id"],))
-                                        conn.commit()
-                                        toast = f"{product['name']} entfernt"
-                                else:
-                                    toast = f"{product['name']} hinzugefügt ✅"
-                                _ack(toast)
-                                product_rows = conn.execute(
-                                    "SELECT p.id, p.name FROM products p"
-                                    " WHERE p.store_id = ? ORDER BY p.name",
-                                    (product["store_id"],)
-                                ).fetchall()
-                                on_list: set = set()
-                                if list_id:
-                                    on_list = {r["name"].lower() for r in conn.execute(
-                                        "SELECT name FROM list_items WHERE list_id=? AND checked=0",
-                                        (list_id,)
-                                    ).fetchall()}
-                                conn.close()
-                                requests.post(f"{bot.api}/editMessageReplyMarkup", json={
-                                    "chat_id": chat_id,
-                                    "message_id": message_id,
-                                    "reply_markup": _catalog_keyboard(product_rows, on_list),
-                                }, timeout=10)
-                            else:
-                                conn.close()
-                                _ack()
-                        else:
+                        with _food_lock:
+                            catalog = _food_catalog(bot)
+                            product = _food_find(catalog, product_id)
+                        if not product:
                             _ack()
+                        else:
+                            with _food_lock:
+                                stores  = _food_stores(bot)
+                                lst     = _food_list(bot) or {"items": []}
+                                now     = datetime.now().isoformat(timespec="seconds")
+                                existing = next((i for i in lst["items"] if i["name"].lower() == product["name"].lower()), None)
+                                if not existing:
+                                    lst["items"].append({"id": max((i.get("id", 0) for i in lst["items"]), default=0) + 1, "name": product["name"], "store_id": product["store_id"], "qty": "", "checked": False, "added_at": now, "status_changed_at": None})
+                                    toast = f"{product['name']} hinzugefügt ✅"
+                                elif existing["checked"]:
+                                    existing["checked"] = False
+                                    existing["status_changed_at"] = now
+                                    toast = f"{product['name']} hinzugefügt ✅"
+                                else:
+                                    lst["items"] = [i for i in lst["items"] if i.get("id") != existing["id"]]
+                                    toast = f"{product['name']} entfernt"
+                                _food_save(bot, "list.yaml", lst)
+                                store_prods = sorted([p for p in catalog if p.get("store_id") == product["store_id"]], key=lambda p: p["name"])
+                                on_list: set = {i["name"].lower() for i in lst["items"] if not i.get("checked")}
+                            _ack(toast)
+                            requests.post(f"{bot.api}/editMessageReplyMarkup", json={
+                                "chat_id": chat_id,
+                                "message_id": message_id,
+                                "reply_markup": _catalog_keyboard(store_prods, on_list),
+                            }, timeout=10)
                     except Exception as e:
                         print(f"[{bot.name}] catalog callback error: {e}")
                         _ack()
                 elif data.startswith("catstore:"):
                     _ack()
                     try:
-                        store_id = int(data.split(":")[1])
-                        conn = _food_db(bot)
-                        if conn:
-                            list_id = _active_list_id(conn)
-                            on_list: set = set()
-                            if list_id:
-                                on_list = {r["name"].lower() for r in conn.execute(
-                                    "SELECT name FROM list_items WHERE list_id=? AND checked=0",
-                                    (list_id,)
-                                ).fetchall()}
-                            if store_id == 0:
-                                products = conn.execute(
-                                    """SELECT p.id, p.name, s.name AS store
-                                       FROM products p JOIN stores s ON p.store_id = s.id
-                                       ORDER BY s.name, p.name"""
-                                ).fetchall()
-                                conn.close()
-                                if not products:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": "Noch keine Produkte im Katalog.",
-                                    }, timeout=10)
-                                else:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": "Alle Geschäfte — Katalog:",
-                                        "reply_markup": _catalog_all_keyboard(products, on_list),
-                                    }, timeout=10)
+                        store_id_val = int(data.split(":")[1])
+                        stores  = _food_stores(bot)
+                        catalog = _food_catalog(bot)
+                        lst     = _food_list(bot)
+                        on_list = {i["name"].lower() for i in (lst.get("items", []) if lst else []) if not i.get("checked")}
+                        if store_id_val == 0:
+                            enriched = _food_enrich(sorted(catalog, key=lambda p: (p.get("store_id", 0), p["name"].lower())), stores)
+                            if not enriched:
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Noch keine Produkte im Katalog."}, timeout=10)
                             else:
-                                store_row = conn.execute(
-                                    "SELECT name FROM stores WHERE id = ?", (store_id,)
-                                ).fetchone()
-                                products = conn.execute(
-                                    "SELECT p.id, p.name FROM products p WHERE p.store_id = ? ORDER BY p.name",
-                                    (store_id,)
-                                ).fetchall()
-                                conn.close()
-                                store_name = store_row["name"] if store_row else "Katalog"
-                                if not products:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": f"Keine Produkte für {store_name}.",
-                                    }, timeout=10)
-                                else:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": f"Katalog — {store_name}:",
-                                        "reply_markup": _catalog_keyboard(products, on_list),
-                                    }, timeout=10)
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Alle Geschäfte — Katalog:", "reply_markup": _catalog_all_keyboard(enriched, on_list)}, timeout=10)
+                        else:
+                            store = _food_find(stores, store_id_val)
+                            products = sorted([p for p in catalog if p.get("store_id") == store_id_val], key=lambda p: p["name"])
+                            store_name = store["name"] if store else "Katalog"
+                            if not products:
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": f"Keine Produkte für {store_name}."}, timeout=10)
+                            else:
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": f"Katalog — {store_name}:", "reply_markup": _catalog_keyboard(products, on_list)}, timeout=10)
                     except Exception as e:
                         print(f"[{bot.name}] catstore callback error: {e}")
                 elif data.startswith("catall:"):
-                    _ack()
                     try:
                         product_id = int(data.split(":")[1])
-                        conn = _food_db(bot)
-                        if conn:
-                            product = conn.execute(
-                                "SELECT p.id, p.name, p.store_id FROM products p WHERE p.id = ?",
-                                (product_id,)
-                            ).fetchone()
-                            if product:
-                                list_id = _active_list_id(conn)
-                                already = False
-                                if list_id:
-                                    existing = conn.execute(
-                                        "SELECT id, checked FROM list_items WHERE list_id=? AND name=? COLLATE NOCASE",
-                                        (list_id, product["name"])
-                                    ).fetchone()
-                                    now = datetime.now().isoformat(timespec="seconds")
-                                    if not existing:
-                                        conn.execute(
-                                            "INSERT INTO list_items"
-                                            " (list_id, name, store_id, checked, added_at, status_changed_at)"
-                                            " VALUES (?,?,?,0,?,?)",
-                                            (list_id, product["name"], product["store_id"], now, now),
-                                        )
-                                        conn.commit()
-                                        toast = f"{product['name']} hinzugefügt ✅"
-                                    elif existing["checked"]:
-                                        conn.execute(
-                                            "UPDATE list_items SET checked=0, status_changed_at=? WHERE id=?",
-                                            (now, existing["id"]),
-                                        )
-                                        conn.commit()
-                                        toast = f"{product['name']} hinzugefügt ✅"
-                                    else:
-                                        conn.execute("DELETE FROM list_items WHERE id=?", (existing["id"],))
-                                        conn.commit()
-                                        toast = f"{product['name']} entfernt"
-                                else:
+                        with _food_lock:
+                            stores  = _food_stores(bot)
+                            catalog = _food_catalog(bot)
+                            product = _food_find(catalog, product_id)
+                        if not product:
+                            _ack()
+                        else:
+                            with _food_lock:
+                                lst  = _food_list(bot) or {"items": []}
+                                now  = datetime.now().isoformat(timespec="seconds")
+                                existing = next((i for i in lst["items"] if i["name"].lower() == product["name"].lower()), None)
+                                if not existing:
+                                    lst["items"].append({"id": max((i.get("id", 0) for i in lst["items"]), default=0) + 1, "name": product["name"], "store_id": product["store_id"], "qty": "", "checked": False, "added_at": now, "status_changed_at": None})
                                     toast = f"{product['name']} hinzugefügt ✅"
-                                _ack(toast)
-                                all_products = conn.execute(
-                                    """SELECT p.id, p.name, s.name AS store
-                                       FROM products p JOIN stores s ON p.store_id = s.id
-                                       ORDER BY s.name, p.name"""
-                                ).fetchall()
-                                on_list: set = set()
-                                if list_id:
-                                    on_list = {r["name"].lower() for r in conn.execute(
-                                        "SELECT name FROM list_items WHERE list_id=? AND checked=0",
-                                        (list_id,)
-                                    ).fetchall()}
-                                conn.close()
-                                requests.post(f"{bot.api}/editMessageReplyMarkup", json={
-                                    "chat_id": chat_id,
-                                    "message_id": message_id,
-                                    "reply_markup": _catalog_all_keyboard(all_products, on_list),
-                                }, timeout=10)
-                            else:
-                                conn.close()
-                                _ack()
+                                elif existing["checked"]:
+                                    existing["checked"] = False
+                                    existing["status_changed_at"] = now
+                                    toast = f"{product['name']} hinzugefügt ✅"
+                                else:
+                                    lst["items"] = [i for i in lst["items"] if i.get("id") != existing["id"]]
+                                    toast = f"{product['name']} entfernt"
+                                _food_save(bot, "list.yaml", lst)
+                                enriched = _food_enrich(sorted(catalog, key=lambda p: (p.get("store_id", 0), p["name"].lower())), stores)
+                                on_list: set = {i["name"].lower() for i in lst["items"] if not i.get("checked")}
+                            _ack(toast)
+                            requests.post(f"{bot.api}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": message_id, "reply_markup": _catalog_all_keyboard(enriched, on_list)}, timeout=10)
                     except Exception as e:
                         print(f"[{bot.name}] catall callback error: {e}")
                         _ack()
                 elif data.startswith("liststore:"):
                     _ack()
                     try:
-                        store_id = int(data.split(":")[1])
-                        conn = _food_db(bot)
-                        if conn:
-                            list_id = _active_list_id(conn)
-                            if store_id == 0:
-                                items = _all_list_items(conn, list_id) if list_id else []
-                                conn.close()
-                                if not items:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": "Die Einkaufsliste ist leer.",
-                                    }, timeout=10)
-                                else:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": "Alle Geschäfte — antippen zum Ab- oder Abhaken:",
-                                        "reply_markup": _check_all_keyboard(items),
-                                    }, timeout=10)
+                        store_id_val = int(data.split(":")[1])
+                        stores = _food_stores(bot)
+                        lst    = _food_list(bot)
+                        if store_id_val == 0:
+                            items = _food_enrich(_food_active_items(lst), stores) if lst else []
+                            if not items:
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Die Einkaufsliste ist leer."}, timeout=10)
                             else:
-                                store_row = conn.execute(
-                                    "SELECT name FROM stores WHERE id = ?", (store_id,)
-                                ).fetchone()
-                                items = _store_list_items(conn, list_id, store_id) if list_id else []
-                                conn.close()
-                                store_name = store_row["name"] if store_row else "Einkaufsliste"
-                                if not items:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": f"Nichts auf der Liste für {store_name}.",
-                                    }, timeout=10)
-                                else:
-                                    requests.post(f"{bot.api}/editMessageText", json={
-                                        "chat_id": chat_id,
-                                        "message_id": message_id,
-                                        "text": f"{store_name} — antippen zum Ab- oder Abhaken:",
-                                        "reply_markup": _check_keyboard(items),
-                                    }, timeout=10)
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Alle Geschäfte — antippen zum Ab- oder Abhaken:", "reply_markup": _check_all_keyboard(items)}, timeout=10)
+                        else:
+                            store = _food_find(stores, store_id_val)
+                            items = _food_enrich(_food_active_items(lst, store_id=store_id_val), stores) if lst else []
+                            store_name = store["name"] if store else "Einkaufsliste"
+                            if not items:
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": f"Nichts auf der Liste für {store_name}."}, timeout=10)
+                            else:
+                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": f"{store_name} — antippen zum Ab- oder Abhaken:", "reply_markup": _check_keyboard(items)}, timeout=10)
                     except Exception as e:
                         print(f"[{bot.name}] liststore callback error: {e}")
                 elif data.startswith("checkall:") or data.startswith("uncheckall:"):
                     _ack()
                     try:
                         checking = data.startswith("checkall:")
-                        item_id = int(data.split(":")[1])
-                        conn = _food_db(bot)
-                        if conn:
-                            conn.execute(
-                                "UPDATE list_items SET checked=?, status_changed_at=? WHERE id=?",
-                                (1 if checking else 0,
-                                 datetime.now().isoformat(timespec="seconds"),
-                                 item_id),
-                            )
-                            conn.commit()
-                            list_id = _active_list_id(conn)
-                            items = _all_list_items(conn, list_id) if list_id else []
-                            conn.close()
-                            requests.post(f"{bot.api}/editMessageReplyMarkup", json={
-                                "chat_id": chat_id,
-                                "message_id": message_id,
-                                "reply_markup": _check_all_keyboard(items),
-                            }, timeout=10)
+                        item_id  = int(data.split(":")[1])
+                        with _food_lock:
+                            stores = _food_stores(bot)
+                            lst    = _food_list(bot)
+                            if lst:
+                                item = _food_find(lst.get("items", []), item_id)
+                                if item:
+                                    item["checked"] = checking
+                                    item["status_changed_at"] = datetime.now().isoformat(timespec="seconds")
+                                    _food_save(bot, "list.yaml", lst)
+                            items = _food_enrich(_food_active_items(lst), stores) if lst else []
+                        requests.post(f"{bot.api}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": message_id, "reply_markup": _check_all_keyboard(items)}, timeout=10)
                     except Exception as e:
                         print(f"[{bot.name}] checkall callback error: {e}")
                 elif data.startswith("clearlist:"):
                     action = data.split(":")[1]
                     if action == "cancel":
                         _ack()
-                        requests.post(f"{bot.api}/editMessageText", json={
-                            "chat_id": chat_id,
-                            "message_id": message_id,
-                            "text": "Abgebrochen.",
-                        }, timeout=10)
+                        requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Abgebrochen."}, timeout=10)
                     elif action == "confirm":
                         try:
-                            conn = _food_db(bot)
-                            if conn:
-                                list_id = _active_list_id(conn)
-                                if list_id:
-                                    conn.execute("DELETE FROM list_items WHERE list_id=?", (list_id,))
-                                    conn.commit()
-                                conn.close()
+                            with _food_lock:
+                                lst = _food_list(bot)
+                                if lst:
+                                    lst["items"] = []
+                                    _food_save(bot, "list.yaml", lst)
                             _ack()
-                            requests.post(f"{bot.api}/editMessageText", json={
-                                "chat_id": chat_id,
-                                "message_id": message_id,
-                                "text": "Einkaufsliste geleert.",
-                            }, timeout=10)
+                            requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Einkaufsliste geleert."}, timeout=10)
                         except Exception as e:
                             print(f"[{bot.name}] clearlist callback error: {e}")
                             _ack()
@@ -1400,31 +1233,20 @@ def poller(bot: Bot) -> None:
                     _ack()
                     try:
                         checking = data.startswith("check:")
-                        item_id = int(data.split(":")[1])
-                        conn = _food_db(bot)
-                        if conn:
-                            conn.execute(
-                                "UPDATE list_items SET checked=?, status_changed_at=? WHERE id=?",
-                                (1 if checking else 0,
-                                 datetime.now().isoformat(timespec="seconds"),
-                                 item_id),
-                            )
-                            conn.commit()
-                            # Rebuild keyboard for this item's store only
-                            item_row = conn.execute(
-                                "SELECT store_id FROM list_items WHERE id = ?", (item_id,)
-                            ).fetchone()
-                            list_id = _active_list_id(conn)
-                            if item_row and list_id:
-                                items = _store_list_items(conn, list_id, item_row["store_id"])
-                            else:
-                                items = []
-                            conn.close()
-                            requests.post(f"{bot.api}/editMessageReplyMarkup", json={
-                                "chat_id": chat_id,
-                                "message_id": message_id,
-                                "reply_markup": _check_keyboard(items),
-                            }, timeout=10)
+                        item_id  = int(data.split(":")[1])
+                        with _food_lock:
+                            stores = _food_stores(bot)
+                            lst    = _food_list(bot)
+                            store_id_of_item = None
+                            if lst:
+                                item = _food_find(lst.get("items", []), item_id)
+                                if item:
+                                    store_id_of_item = item.get("store_id")
+                                    item["checked"] = checking
+                                    item["status_changed_at"] = datetime.now().isoformat(timespec="seconds")
+                                    _food_save(bot, "list.yaml", lst)
+                            items = _food_enrich(_food_active_items(lst, store_id=store_id_of_item), stores) if lst and store_id_of_item is not None else []
+                        requests.post(f"{bot.api}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": message_id, "reply_markup": _check_keyboard(items)}, timeout=10)
                     except Exception as e:
                         print(f"[{bot.name}] check callback error: {e}")
                 else:
@@ -1550,7 +1372,12 @@ def scheduler(bot: Bot) -> None:
         # Cron schedules -> enqueue a prompt for the worker.
         for c in crons:
             if c["next"] <= now:
-                bot.queue.put((c["chat_id"], c["prompt"], [], [], True))
+                due_fmt = now.strftime("%Y-%m-%d at %H:%M")
+                invocation = (
+                    f"You are invoked because you were scheduled to run at {due_fmt}. "
+                    f"Your task: \"{c['prompt']}\""
+                )
+                bot.queue.put((c["chat_id"], invocation, [], [], True))
                 c["next"] = c["itr"].get_next(datetime)
                 print(f"[{bot.name}] cron fired; next at {c['next']:%Y-%m-%d %H:%M}")
 
