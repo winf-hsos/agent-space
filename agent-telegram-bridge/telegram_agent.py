@@ -1388,14 +1388,14 @@ def ensure_shared_instructions(bot: "Bot") -> None:
 
     OpenCode auto-loads each workdir's AGENTS.md and *also* concatenates any files
     listed under `instructions` in opencode.json. So the common rules live in one
-    shared file and every agent just points at it -- improvements propagate to all
+    shared file and every agent just points at it — improvements propagate to all
     agents at once, and a new agent needs only its own personality AGENTS.md.
 
-    The reference is stored as a path relative to the workdir (OpenCode resolves
-    `instructions` relative to the config file's directory), which also keeps the
-    whole tree portable to the Raspberry Pi. Existing config is merged, not
-    clobbered; a config file we can't parse (e.g. JSONC with comments) is left
-    untouched with a warning.
+    opencode.json is machine-specific (the path to agents-common.md differs per
+    machine) and must not sync between machines. It is gitignored and should also
+    be excluded from Obsidian Sync. On each startup the bridge rewrites the
+    instructions entry to exactly the correct path for this machine, replacing any
+    stale path that may have arrived via sync.
     """
     if not SHARED_INSTRUCTIONS.exists():
         print(f"[{bot.name}] shared instructions file not found: {SHARED_INSTRUCTIONS}")
@@ -1412,12 +1412,15 @@ def ensure_shared_instructions(bot: "Bot") -> None:
             return
         instr = cfg.get("instructions")
         instr = list(instr) if isinstance(instr, list) else ([] if instr is None else [instr])
-        if rel in instr:
-            return
+        # Replace any existing shared-instructions entry (possibly from another
+        # machine via sync) with the correct path for this machine.
+        instr = [p for p in instr if "agents-common" not in p]
         instr.append(rel)
+        if cfg.get("instructions") == instr:
+            return
         cfg["instructions"] = instr
         cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-        print(f"[{bot.name}] linked shared instructions in {cfg_path.name}")
+        print(f"[{bot.name}] updated shared instructions path in {cfg_path.name}")
     else:
         cfg_path.write_text(json.dumps({"instructions": [rel]}, indent=2) + "\n",
                             encoding="utf-8")
