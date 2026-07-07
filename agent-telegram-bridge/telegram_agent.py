@@ -204,6 +204,10 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
     """Run one prompt through the opencode CLI and return only the final answer."""
     if OPENCODE is None:
         return "opencode CLI not found on PATH. Run: npm install -g opencode-ai"
+    if SHARED_INSTRUCTIONS.exists():
+        shared = SHARED_INSTRUCTIONS.read_text(encoding="utf-8").strip()
+        if shared:
+            prompt = f"{shared}\n\n---\n\n{prompt}"
     cmd = [OPENCODE, "run", "--format", "json"]
     if keep_context:
         cmd.append("-c")  # resume previous session => the agent remembers context
@@ -1383,49 +1387,6 @@ def scheduler(bot: Bot) -> None:
 # Config + startup
 # --------------------------------------------------------------------------- #
 
-def ensure_shared_instructions(bot: "Bot") -> None:
-    """Make sure the bot's opencode.json references the shared instructions file.
-
-    OpenCode auto-loads each workdir's AGENTS.md and *also* concatenates any files
-    listed under `instructions` in opencode.json. So the common rules live in one
-    shared file and every agent just points at it — improvements propagate to all
-    agents at once, and a new agent needs only its own personality AGENTS.md.
-
-    opencode.json is machine-specific (the path to agents-common.md differs per
-    machine) and must not sync between machines. It is gitignored and should also
-    be excluded from Obsidian Sync. On each startup the bridge rewrites the
-    instructions entry to exactly the correct path for this machine, replacing any
-    stale path that may have arrived via sync.
-    """
-    if not SHARED_INSTRUCTIONS.exists():
-        print(f"[{bot.name}] shared instructions file not found: {SHARED_INSTRUCTIONS}")
-    rel = os.path.relpath(SHARED_INSTRUCTIONS, bot.workdir).replace(os.sep, "/")
-    if not rel.startswith("."):
-        rel = "./" + rel
-    cfg_path = bot.workdir / "opencode.json"
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[{bot.name}] {cfg_path.name} unreadable; leaving it untouched. "
-                  f"Add {rel!r} to its 'instructions' yourself. ({e})")
-            return
-        instr = cfg.get("instructions")
-        instr = list(instr) if isinstance(instr, list) else ([] if instr is None else [instr])
-        # Replace any existing shared-instructions entry (possibly from another
-        # machine via sync) with the correct path for this machine.
-        instr = [p for p in instr if "agents-common" not in p]
-        instr.append(rel)
-        if cfg.get("instructions") == instr:
-            return
-        cfg["instructions"] = instr
-        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-        print(f"[{bot.name}] updated shared instructions path in {cfg_path.name}")
-    else:
-        cfg_path.write_text(json.dumps({"instructions": [rel]}, indent=2) + "\n",
-                            encoding="utf-8")
-        print(f"[{bot.name}] created {cfg_path.name} referencing shared instructions")
-
 
 def load_config():
     if not CONFIG_PATH.exists():
@@ -1611,7 +1572,6 @@ def main() -> None:
         f"opencode={OPENCODE}  internal={BRIDGE_INTERNAL_URL}"
     )
     for bot in bots:
-        ensure_shared_instructions(bot)
         register_commands(bot)
         threading.Thread(target=worker, args=(bot,), daemon=True).start()
         threading.Thread(target=poller, args=(bot,), daemon=True).start()
