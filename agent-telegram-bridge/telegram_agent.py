@@ -730,8 +730,7 @@ def _food_save(bot: "Bot", filename: str, data) -> None:
     p = bot.workdir / filename
     fm = yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
     if "list" in filename:
-        stores = _food_load(bot, "stores.md") or []
-        body = _food_list_body(data, stores)
+        body = _food_list_body(data, _food_stores(bot))
     else:
         body = ""
     p.write_text(f"---\n{fm}---\n\n{body}", encoding="utf-8")
