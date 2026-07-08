@@ -738,11 +738,22 @@ def _food_save(bot: "Bot", filename: str, data) -> None:
 
 
 def _food_stores(bot: "Bot") -> list:
-    return _food_load(bot, "stores.md") or []
+    data = _food_load(bot, "stores.md")
+    if isinstance(data, dict):
+        return data.get("stores", [])
+    return data or []
 
 
 def _food_catalog(bot: "Bot") -> list:
-    return _food_load(bot, "catalog.md") or []
+    cat_dir = bot.workdir / "catalog"
+    if not cat_dir.exists():
+        return []
+    products = []
+    for f in sorted(cat_dir.glob("*.md")):
+        data = _food_parse_frontmatter(f.read_text(encoding="utf-8"))
+        if data and data.get("name"):
+            products.append(data)
+    return products
 
 
 def _food_list(bot: "Bot") -> "dict | None":
@@ -826,29 +837,6 @@ def _check_all_keyboard(items: list) -> dict:
         rows.append([{"text": text, "callback_data": data}])
     return {"inline_keyboard": rows}
 
-
-def _catalog_keyboard(products, on_list: set) -> dict:
-    """Inline keyboard for a single-store catalog. Uses cat: prefix."""
-    sorted_products = sorted(products, key=lambda p: (p["name"].lower() not in on_list, p["name"].lower()))
-    rows = []
-    for p in sorted_products:
-        on = p["name"].lower() in on_list
-        text = f"🛒 {p['name']}" if on else p["name"]
-        rows.append([{"text": text, "callback_data": f"cat:{p['id']}"}])
-    return {"inline_keyboard": rows}
-
-
-def _catalog_all_keyboard(products, on_list: set) -> dict:
-    """Inline keyboard for the all-stores catalog: shows store name in button text.
-    Uses catall: prefix so the callback rebuilds the full catalog."""
-    sorted_products = sorted(products, key=lambda p: (p["name"].lower() not in on_list, p["name"].lower()))
-    rows = []
-    for p in sorted_products:
-        on = p["name"].lower() in on_list
-        store = f" · {p['store']}" if p["store"] else ""
-        text = f"🛒 {p['name']}{store}" if on else f"{p['name']}{store}"
-        rows.append([{"text": text, "callback_data": f"catall:{p['id']}"}])
-    return {"inline_keyboard": rows}
 
 
 def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
@@ -1005,19 +993,11 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
     if cmd == "/stores":
         if not _food_active(bot):
             return False
-        try:
-            stores = sorted(_food_stores(bot), key=lambda s: s["name"])
-        except Exception as e:
-            send(bot.api, chat_id, f"Fehler: {e}")
-            return True
+        stores = sorted(_food_stores(bot), key=lambda s: s["name"])
         if not stores:
             send(bot.api, chat_id, "Noch keine Geschäfte konfiguriert.")
-            return True
-        requests.post(f"{bot.api}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": "Welches Geschäft?",
-            "reply_markup": _store_picker_keyboard(stores, prefix="catstore"),
-        }, timeout=10)
+        else:
+            send(bot.api, chat_id, "\n".join(f"• {s['name']}" for s in stores))
         return True
 
     if cmd == "/catalog":
@@ -1026,35 +1006,19 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
         parts = text.strip().split(None, 1)
         store_filter = parts[1].strip() if len(parts) > 1 else None
         try:
-            stores  = _food_stores(bot)
-            catalog = _food_catalog(bot)
-            lst = _food_list(bot)
-            on_list: set = {i["name"].lower() for i in (lst.get("items", []) if lst else []) if not i.get("checked")}
+            catalog = sorted(_food_catalog(bot), key=lambda p: (p.get("store", ""), p["name"].lower()))
             if store_filter:
-                store = next((s for s in stores if s["name"].lower() == store_filter.lower()), None)
-                if not store:
-                    send(bot.api, chat_id, f"Geschäft <b>{html.escape(store_filter)}</b> nicht gefunden.", parse_mode="HTML")
-                    return True
-                products = sorted([p for p in catalog if p.get("store_id") == store["id"]], key=lambda p: p["name"])
-                if not products:
-                    send(bot.api, chat_id, f"Keine Produkte für <b>{html.escape(store['name'])}</b> im Katalog.", parse_mode="HTML")
-                    return True
-                requests.post(f"{bot.api}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": f"Katalog — {store['name']}:",
-                    "reply_markup": _catalog_keyboard(products, on_list),
-                }, timeout=30)
-            else:
-                catalog_store_ids = {p.get("store_id") for p in catalog}
-                picker_stores = sorted([s for s in stores if s["id"] in catalog_store_ids], key=lambda s: s["name"])
-                if not picker_stores:
-                    send(bot.api, chat_id, "Noch keine Produkte im Katalog.")
-                    return True
-                requests.post(f"{bot.api}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": "Welches Geschäft?",
-                    "reply_markup": _store_picker_keyboard(picker_stores, prefix="catstore"),
-                }, timeout=30)
+                catalog = [p for p in catalog if p.get("store", "").lower() == store_filter.lower()]
+            if not catalog:
+                send(bot.api, chat_id, "Keine Produkte im Katalog." if not store_filter else f"Keine Produkte für {store_filter}.")
+                return True
+            lines, current_store = [], None
+            for p in catalog:
+                if p.get("store") != current_store:
+                    current_store = p.get("store", "")
+                    lines.append(f"\n<b>{html.escape(current_store)}</b>" if current_store else "\n<b>Kein Geschäft</b>")
+                lines.append(f"• {html.escape(p['name'])}")
+            send(bot.api, chat_id, "\n".join(lines).strip(), parse_mode="HTML")
         except Exception as e:
             send(bot.api, chat_id, f"Fehler: {e}")
         return True
@@ -1122,98 +1086,6 @@ def poller(bot: Bot) -> None:
                     label = data[7:].strip()
                     if label:
                         bot.queue.put((chat_id, label, [], [], False))
-                elif data.startswith("cat:"):
-                    try:
-                        product_id = int(data.split(":")[1])
-                        with _food_lock:
-                            catalog = _food_catalog(bot)
-                            product = _food_find(catalog, product_id)
-                        if not product:
-                            _ack()
-                        else:
-                            with _food_lock:
-                                stores  = _food_stores(bot)
-                                lst     = _food_list(bot) or {"items": []}
-                                now     = datetime.now().isoformat(timespec="seconds")
-                                existing = next((i for i in lst["items"] if i["name"].lower() == product["name"].lower()), None)
-                                if not existing:
-                                    lst["items"].append({"id": max((i.get("id", 0) for i in lst["items"]), default=0) + 1, "name": product["name"], "store_id": product["store_id"], "qty": "", "checked": False, "added_at": now, "status_changed_at": None})
-                                    toast = f"{product['name']} hinzugefügt ✅"
-                                elif existing["checked"]:
-                                    existing["checked"] = False
-                                    existing["status_changed_at"] = now
-                                    toast = f"{product['name']} hinzugefügt ✅"
-                                else:
-                                    lst["items"] = [i for i in lst["items"] if i.get("id") != existing["id"]]
-                                    toast = f"{product['name']} entfernt"
-                                _food_save(bot, "list.md", lst)
-                                store_prods = sorted([p for p in catalog if p.get("store_id") == product["store_id"]], key=lambda p: p["name"])
-                                on_list: set = {i["name"].lower() for i in lst["items"] if not i.get("checked")}
-                            _ack(toast)
-                            requests.post(f"{bot.api}/editMessageReplyMarkup", json={
-                                "chat_id": chat_id,
-                                "message_id": message_id,
-                                "reply_markup": _catalog_keyboard(store_prods, on_list),
-                            }, timeout=10)
-                    except Exception as e:
-                        print(f"[{bot.name}] catalog callback error: {e}")
-                        _ack()
-                elif data.startswith("catstore:"):
-                    _ack()
-                    try:
-                        store_id_val = int(data.split(":")[1])
-                        stores  = _food_stores(bot)
-                        catalog = _food_catalog(bot)
-                        lst     = _food_list(bot)
-                        on_list = {i["name"].lower() for i in (lst.get("items", []) if lst else []) if not i.get("checked")}
-                        if store_id_val == 0:
-                            enriched = _food_enrich(sorted(catalog, key=lambda p: (p.get("store_id", 0), p["name"].lower())), stores)
-                            if not enriched:
-                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Noch keine Produkte im Katalog."}, timeout=10)
-                            else:
-                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Alle Geschäfte — Katalog:", "reply_markup": _catalog_all_keyboard(enriched, on_list)}, timeout=10)
-                        else:
-                            store = _food_find(stores, store_id_val)
-                            products = sorted([p for p in catalog if p.get("store_id") == store_id_val], key=lambda p: p["name"])
-                            store_name = store["name"] if store else "Katalog"
-                            if not products:
-                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": f"Keine Produkte für {store_name}."}, timeout=10)
-                            else:
-                                requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": f"Katalog — {store_name}:", "reply_markup": _catalog_keyboard(products, on_list)}, timeout=10)
-                    except Exception as e:
-                        print(f"[{bot.name}] catstore callback error: {e}")
-                elif data.startswith("catall:"):
-                    try:
-                        product_id = int(data.split(":")[1])
-                        with _food_lock:
-                            stores  = _food_stores(bot)
-                            catalog = _food_catalog(bot)
-                            product = _food_find(catalog, product_id)
-                        if not product:
-                            _ack()
-                        else:
-                            with _food_lock:
-                                lst  = _food_list(bot) or {"items": []}
-                                now  = datetime.now().isoformat(timespec="seconds")
-                                existing = next((i for i in lst["items"] if i["name"].lower() == product["name"].lower()), None)
-                                if not existing:
-                                    lst["items"].append({"id": max((i.get("id", 0) for i in lst["items"]), default=0) + 1, "name": product["name"], "store_id": product["store_id"], "qty": "", "checked": False, "added_at": now, "status_changed_at": None})
-                                    toast = f"{product['name']} hinzugefügt ✅"
-                                elif existing["checked"]:
-                                    existing["checked"] = False
-                                    existing["status_changed_at"] = now
-                                    toast = f"{product['name']} hinzugefügt ✅"
-                                else:
-                                    lst["items"] = [i for i in lst["items"] if i.get("id") != existing["id"]]
-                                    toast = f"{product['name']} entfernt"
-                                _food_save(bot, "list.md", lst)
-                                enriched = _food_enrich(sorted(catalog, key=lambda p: (p.get("store_id", 0), p["name"].lower())), stores)
-                                on_list: set = {i["name"].lower() for i in lst["items"] if not i.get("checked")}
-                            _ack(toast)
-                            requests.post(f"{bot.api}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": message_id, "reply_markup": _catalog_all_keyboard(enriched, on_list)}, timeout=10)
-                    except Exception as e:
-                        print(f"[{bot.name}] catall callback error: {e}")
-                        _ack()
                 elif data.startswith("liststore:"):
                     _ack()
                     try:
