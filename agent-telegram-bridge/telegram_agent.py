@@ -674,34 +674,79 @@ _food_lock = threading.Lock()
 
 
 def _food_active(bot: "Bot") -> bool:
-    """True if this agent uses YAML food data (stores.yaml or list.yaml present)."""
-    return (bot.workdir / "stores.yaml").exists() or (bot.workdir / "list.yaml").exists()
+    """True if this agent uses markdown food data (.md or legacy .yaml present)."""
+    wd = bot.workdir
+    return (
+        (wd / "stores.md").exists() or (wd / "list.md").exists() or
+        (wd / "stores.yaml").exists() or (wd / "list.yaml").exists()
+    )
+
+
+def _food_parse_frontmatter(text: str):
+    """Parse YAML frontmatter from a markdown file."""
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return None
+    return yaml.safe_load(text[4:end])
 
 
 def _food_load(bot: "Bot", filename: str):
     p = bot.workdir / filename
-    if not p.exists():
-        return None
-    with p.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    if p.exists():
+        text = p.read_text(encoding="utf-8")
+        return _food_parse_frontmatter(text)
+    # Migration fallback: old .yaml file
+    yaml_p = p.with_suffix(".yaml")
+    if yaml_p.exists():
+        with yaml_p.open(encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    return None
+
+
+def _food_list_body(lst: dict, stores: list) -> str:
+    store_map = {s["id"]: s["name"] for s in stores}
+    date_str = lst.get("created_at", "")
+    lines = [f"# Shopping List · {date_str}", ""]
+    items = lst.get("items", [])
+    if not items:
+        return "\n".join(lines + ["*List is empty.*", ""])
+    by_store: dict = {}
+    for item in items:
+        sname = store_map.get(item.get("store_id"), "Other")
+        by_store.setdefault(sname, []).append(item)
+    for sname in sorted(by_store):
+        lines.append(f"## {sname}")
+        for item in sorted(by_store[sname], key=lambda x: (x.get("checked", False), x["name"].lower())):
+            check = "x" if item.get("checked") else " "
+            qty = f" · {item['qty']}" if item.get("qty") else ""
+            lines.append(f"- [{check}] {item['name']}{qty}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _food_save(bot: "Bot", filename: str, data) -> None:
     p = bot.workdir / filename
-    with p.open("w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    fm = yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    if "list" in filename:
+        stores = _food_load(bot, "stores.md") or []
+        body = _food_list_body(data, stores)
+    else:
+        body = ""
+    p.write_text(f"---\n{fm}---\n\n{body}", encoding="utf-8")
 
 
 def _food_stores(bot: "Bot") -> list:
-    return _food_load(bot, "stores.yaml") or []
+    return _food_load(bot, "stores.md") or []
 
 
 def _food_catalog(bot: "Bot") -> list:
-    return _food_load(bot, "catalog.yaml") or []
+    return _food_load(bot, "catalog.md") or []
 
 
 def _food_list(bot: "Bot") -> "dict | None":
-    data = _food_load(bot, "list.yaml")
+    data = _food_load(bot, "list.md")
     if data is not None and "items" not in data:
         data["items"] = []
     return data
@@ -1101,7 +1146,7 @@ def poller(bot: Bot) -> None:
                                 else:
                                     lst["items"] = [i for i in lst["items"] if i.get("id") != existing["id"]]
                                     toast = f"{product['name']} entfernt"
-                                _food_save(bot, "list.yaml", lst)
+                                _food_save(bot, "list.md", lst)
                                 store_prods = sorted([p for p in catalog if p.get("store_id") == product["store_id"]], key=lambda p: p["name"])
                                 on_list: set = {i["name"].lower() for i in lst["items"] if not i.get("checked")}
                             _ack(toast)
@@ -1161,7 +1206,7 @@ def poller(bot: Bot) -> None:
                                 else:
                                     lst["items"] = [i for i in lst["items"] if i.get("id") != existing["id"]]
                                     toast = f"{product['name']} entfernt"
-                                _food_save(bot, "list.yaml", lst)
+                                _food_save(bot, "list.md", lst)
                                 enriched = _food_enrich(sorted(catalog, key=lambda p: (p.get("store_id", 0), p["name"].lower())), stores)
                                 on_list: set = {i["name"].lower() for i in lst["items"] if not i.get("checked")}
                             _ack(toast)
@@ -1204,7 +1249,7 @@ def poller(bot: Bot) -> None:
                                 if item:
                                     item["checked"] = checking
                                     item["status_changed_at"] = datetime.now().isoformat(timespec="seconds")
-                                    _food_save(bot, "list.yaml", lst)
+                                    _food_save(bot, "list.md", lst)
                             items = _food_enrich(_food_active_items(lst), stores) if lst else []
                         requests.post(f"{bot.api}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": message_id, "reply_markup": _check_all_keyboard(items)}, timeout=10)
                     except Exception as e:
@@ -1220,7 +1265,7 @@ def poller(bot: Bot) -> None:
                                 lst = _food_list(bot)
                                 if lst:
                                     lst["items"] = []
-                                    _food_save(bot, "list.yaml", lst)
+                                    _food_save(bot, "list.md", lst)
                             _ack()
                             requests.post(f"{bot.api}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": "Einkaufsliste geleert."}, timeout=10)
                         except Exception as e:
@@ -1243,7 +1288,7 @@ def poller(bot: Bot) -> None:
                                     store_id_of_item = item.get("store_id")
                                     item["checked"] = checking
                                     item["status_changed_at"] = datetime.now().isoformat(timespec="seconds")
-                                    _food_save(bot, "list.yaml", lst)
+                                    _food_save(bot, "list.md", lst)
                             items = _food_enrich(_food_active_items(lst, store_id=store_id_of_item), stores) if lst and store_id_of_item is not None else []
                         requests.post(f"{bot.api}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": message_id, "reply_markup": _check_keyboard(items)}, timeout=10)
                     except Exception as e:
