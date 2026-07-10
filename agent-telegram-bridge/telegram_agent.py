@@ -381,6 +381,28 @@ def _build_agent(bot: "Bot") -> Agent:
         return text
 
     @agent.tool
+    def write_file(ctx: RunContext[Deps], path: str, content: str) -> str:
+        """Create or overwrite a UTF-8 text file in your working directory with
+        `content` — the COMPLETE new file contents. To UPDATE a file, read_file it
+        first, then write the full updated text back (keep everything you are not
+        changing). This is the ONLY reliable way to save; never tell Nicolas you
+        saved or updated something unless you have called this in the same turn."""
+        target = _safe_target(ctx.deps.bot, path)
+        if target is None:
+            return "Error: path is outside your working directory."
+        if target.is_dir():
+            return f"Error: {path} is a directory."
+        # Safety net for models that flatten the whole file onto one line with \n.
+        if "\n" not in content and "\\n" in content:
+            content = content.replace("\\n", "\n").replace("\\t", "\t")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except Exception as e:
+            return f"Error writing {path}: {e}"
+        return f"Saved {path} ({len(content)} chars)."
+
+    @agent.tool
     def search_files(ctx: RunContext[Deps], query: str, subdir: str = ".",
                      extensions: str = ".md,.txt") -> str:
         """Case-insensitive search for `query` inside the text files under `subdir`
