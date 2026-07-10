@@ -1,39 +1,49 @@
 ﻿"""
-Multi-bot Telegram -> OpenCode bridge.
+Multi-bot Telegram -> Pydantic AI bridge.
 
 Runs several Telegram bots from a single process. Each bot is backed by its own
-OpenCode agent: its own working directory (with its own AGENTS.md), its own
-allowed users, and its own session behavior. Bots are declared in agents.yaml;
-secrets (tokens) stay in environment variables / a .env file.
+Pydantic AI agent: its own working directory (with its own AGENTS.md), its own
+allowed users, its own model. Bots are declared in agents.yaml; secrets (tokens)
+stay in environment variables / a .env file.
+
+Each agent has three tools:
+  - chat_respond(text)  native tool that delivers a message to Telegram (markers
+                        processed in-process; replaces the old shell script +
+                        internal HTTP server).
+  - bash(command)       runs a shell command in the agent's workdir with the
+                        shared + agent-local tool folders on PATH (food-add,
+                        remind, schedule, etc.). Preserves the folder/markdown
+                        workflow unchanged.
+  - web search          OpenAI's native web search (Responses API), used e.g. by
+                        the food agent's morning recipe cron.
 
 Design:
   - One *poller* thread per bot long-polls Telegram (each token needs its own
     getUpdates consumer) and enqueues messages.
-  - One *worker* thread per bot processes that bot's messages strictly in order
-    -- which keeps `continue` sessions and wiki writes consistent.
+  - One *worker* thread per bot processes that bot's messages strictly in order.
   - A single global semaphore (`concurrency` in agents.yaml) caps how many agents
     run at the same time across ALL bots. This is the key guard on small
     hardware like a Raspberry Pi 5.
 
 Setup:
-  1. npm install -g opencode-ai   &&   opencode auth login
+  1. pip install -r requirements.txt
   2. Create each bot via @BotFather; put its token in .env.
-  3. pip install -r requirements.txt
+  3. Put OPENAI_API_KEY in .env.
   4. Edit agents.yaml, then run:  python telegram_agent.py
 
 Env vars (user-set):
   <token_env>           - one per agent, named in agents.yaml
   AGENTS_CONFIG         - optional, path to agents.yaml (default: next to this file)
-  OPENCODE_BIN          - optional, explicit path to opencode executable
-  BRIDGE_INTERNAL_PORT  - optional, port for internal HTTP server (default: 7861)
+  OPENAI_API_KEY        - required; agent model + voice transcription
+  AGENT_REQUEST_LIMIT   - optional, max model requests per run (default: 20)
 
-Env vars injected into agent subprocesses:
+Env vars injected into the bash tool's subprocess:
   TELEGRAM_CHAT_ID      - current chat ID
-  TELEGRAM_BOT_TOKEN    - this bot's token (for chat_respond)
-  BRIDGE_INTERNAL_URL   - http://127.0.0.1:<port> (for chat_respond routing)
+  TELEGRAM_BOT_TOKEN    - this bot's token (for remind/schedule/food tools)
 """
 
 import ast
+import asyncio
 import contextlib
 import html
 import json
@@ -41,17 +51,24 @@ import os
 import queue
 import re
 import sys
-import shutil
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import requests
 import yaml
 from dotenv import load_dotenv
+
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import NativeTool
+from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.native_tools import WebSearchTool
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.usage import UsageLimits
 
 try:
     from croniter import croniter  # for cron `schedules` in agents.yaml
@@ -68,16 +85,21 @@ CONFIG_PATH = Path(os.environ.get("AGENTS_CONFIG", BRIDGE_DIR / "agents.yaml"))
 TOOLS_DIR = Path(
     os.environ.get("AGENT_TOOLS_DIR", BRIDGE_DIR.parent / "agent-tools")
 ).resolve()
-# Shared instructions appended to every agent (via each workdir's opencode.json
-# `instructions`). Maintain once here; all agents pick it up. See
-# ensure_shared_instructions().
+# Shared instructions prepended to every agent's system prompt. Maintain once
+# here; all agents pick it up. Read fresh each run so webui edits take effect
+# without a restart.
 SHARED_INSTRUCTIONS = TOOLS_DIR / "shared" / "agents-common.md"
 TELEGRAM_LIMIT = 4096
 RUN_TIMEOUT = 600  # seconds an agent may work on a single message
 REMINDER_PREFIX = "Erinnerung"  # bold label prepended to delivered reminders
 
+# Max model requests (tool round-trips) per run — guards against runaway loops.
+AGENT_REQUEST_LIMIT = int(os.environ.get("AGENT_REQUEST_LIMIT", "20"))
+# Per-command timeout for the bash tool (seconds).
+BASH_TIMEOUT = int(os.environ.get("BASH_TIMEOUT", "120"))
+
 # Agent invocation logging. Set AGENT_LOG=1 in .env to enable.
-# Logs full prompt + raw opencode output per run to logs/<agent>.log
+# Logs full prompt + final output + usage per run to logs/<agent>.log
 AGENT_LOG = os.environ.get("AGENT_LOG", "0").strip().lower() in ("1", "true", "yes")
 AGENT_LOG_DIR = Path(os.environ.get("AGENT_LOG_DIR", BRIDGE_DIR / "logs"))
 
@@ -88,94 +110,24 @@ TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "whisper-1")
 # Caps concurrent agent runs across all bots; replaced in main() from the config.
 AGENT_SLOTS = threading.Semaphore(1)
 
-# Internal HTTP server for chat_respond tool routing (localhost only).
-# chat_respond POSTs here so the bridge can process markers before sending.
-INTERNAL_PORT = int(os.environ.get("BRIDGE_INTERNAL_PORT", "7861"))
-BRIDGE_INTERNAL_URL: str | None = None  # set in main() after server starts
-_bots_by_token: dict = {}               # token → Bot, populated in main()
 _history_lock = threading.Lock()        # serialises all history file writes
-_chat_responded: dict = {}             # (token, chat_id) → bool; reset each run
-_chat_responded_lock = threading.Lock()
-
-
-def _resolve_opencode():
-    """Locate the opencode executable, preferring the real binary over shims.
-
-    On Windows, shutil.which() returns npm's opencode.cmd/.ps1 shim. Running a
-    .cmd routes through cmd.exe, which treats a newline in an argument as a
-    command separator and truncates multi-line prompts at the first line. The
-    shim itself just launches a real opencode.exe, so we resolve to that exe
-    (mirroring the shim's own path) to pass arguments untouched.
-    """
-    override = os.environ.get("OPENCODE_BIN")
-    if override:
-        return override
-    found = shutil.which("opencode")
-    if found and os.name == "nt" and found.lower().endswith((".cmd", ".bat", ".ps1")):
-        exe = Path(found).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
-        if exe.exists():
-            return str(exe)
-    return found
-
-
-OPENCODE = _resolve_opencode()
 
 
 # --------------------------------------------------------------------------- #
-# OpenCode
+# Agent (Pydantic AI)
 # --------------------------------------------------------------------------- #
 
-def extract_answer(stdout: str) -> str:
-    """Reconstruct just the assistant's final answer from opencode's JSONL events.
-
-    `opencode run --format json` emits one JSON event per line: step_start,
-    tool_use, text, step_finish, error. The reply lives in `text` events. A model
-    often writes text BEFORE/BETWEEN tool calls ("I'll set the reminder...") and
-    again AFTER it ("Done, I'll remind you..."), which would otherwise reach the
-    chat as two messages. So we keep only the text emitted after the LAST tool
-    call -- the actual conclusion -- and fall back to all text when no tool ran.
-    Each part id is deduped to its latest snapshot; distinct parts join with a
-    blank line so boundaries don't glue words together.
-    """
-    parts: dict = {}      # part id -> latest text snapshot
-    order: list = []      # part ids in first-appearance order
-    last_tool_pos = -1    # how many text parts had appeared when the last tool ran
-    errors = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        etype = event.get("type", "")
-        part = event.get("part") or {}
-        if etype == "text":
-            text = part.get("text")
-            if text:
-                pid = part.get("id", f"_{len(order)}")
-                if pid not in parts:
-                    order.append(pid)
-                parts[pid] = text
-        elif etype.startswith("tool"):
-            last_tool_pos = len(order)  # text appearing after this is the conclusion
-        elif etype == "error":
-            errors.append(str(part.get("text") or event.get("error") or "unknown error"))
-
-    # Prefer text emitted after the final tool call; if there is none, use all of
-    # it (covers plain answers with no tool, or a tool with no trailing text).
-    final = [pid for pid in order[last_tool_pos:] if parts[pid].strip()] if last_tool_pos >= 0 else []
-    if not final:
-        final = [pid for pid in order if parts[pid].strip()]
-    answer = "\n\n".join(parts[pid].strip() for pid in final).strip()
-    if not answer and errors:
-        return "[agent error] " + " ".join(errors)
-    return answer
+@dataclass
+class Deps:
+    """Per-run context handed to the agent's tools."""
+    bot: "Bot"
+    chat_id: int
+    responded: bool = False              # True once chat_respond delivers a message
+    sent: set = field(default_factory=set)  # texts already delivered this run (dedupe)
 
 
-def _log_invocation(agent_name: str, chat_id: int | None,
-                    prompt: str, stdout: str, stderr: str, duration: float) -> None:
+def _log_invocation(agent_name: str, chat_id: int | None, prompt: str,
+                    output: str, usage: str, duration: float) -> None:
     """Append one agent run to logs/<agent_name>.log (no-op when AGENT_LOG is off)."""
     if not AGENT_LOG:
         return
@@ -186,36 +138,34 @@ def _log_invocation(agent_name: str, chat_id: int | None,
     with log_file.open("a", encoding="utf-8") as fh:
         fh.write(f"\n{bar}\n")
         fh.write(f"{ts}  agent={agent_name}  chat={chat_id}  duration={duration:.1f}s\n")
+        if usage:
+            fh.write(f"usage: {usage}\n")
         fh.write(f"{bar}\n")
         fh.write("PROMPT\n------\n")
         fh.write(prompt.rstrip() + "\n")
-        fh.write("\nOUTPUT (raw opencode JSONL)\n---------------------------\n")
-        fh.write((stdout or "(empty)").rstrip() + "\n")
-        if stderr and stderr.strip():
-            fh.write("\nSTDERR\n------\n")
-            fh.write(stderr.strip() + "\n")
+        fh.write("\nFINAL OUTPUT (fallback text; agent replies via chat_respond)\n")
+        fh.write("-" * 59 + "\n")
+        fh.write((output or "(empty)").rstrip() + "\n")
 
 
-def run_agent(workdir: Path, keep_context: bool, prompt: str,
-              model: str | None = None, timeout: int = RUN_TIMEOUT,
-              chat_id: int | None = None,
-              token: str | None = None,
-              agent_name: str = "agent") -> str:
-    """Run one prompt through the opencode CLI and return only the final answer."""
-    if OPENCODE is None:
-        return "opencode CLI not found on PATH. Run: npm install -g opencode-ai"
+def _system_prompt(workdir: Path) -> str:
+    """Shared instructions + the agent's own AGENTS.md, read fresh each run."""
+    parts = []
     if SHARED_INSTRUCTIONS.exists():
-        shared = SHARED_INSTRUCTIONS.read_text(encoding="utf-8").strip()
-        if shared:
-            prompt = f"{shared}\n\n---\n\n{prompt}"
-    cmd = [OPENCODE, "run", "--format", "json"]
-    if keep_context:
-        cmd.append("-c")  # resume previous session => the agent remembers context
-    if model:
-        cmd += ["-m", model]  # provider/model, e.g. anthropic/claude-sonnet-4-6
-    cmd.append(prompt)
-    # Build PATH: shared tool subfolders (agent-tools/*) for all agents,
-    # plus workdir/tools/ for agent-local tools (e.g. food-specific scripts).
+        s = SHARED_INSTRUCTIONS.read_text(encoding="utf-8").strip()
+        if s:
+            parts.append(s)
+    agents_md = workdir / "AGENTS.md"
+    if agents_md.exists():
+        a = agents_md.read_text(encoding="utf-8").strip()
+        if a:
+            parts.append(a)
+    return "\n\n---\n\n".join(parts) or "You are a helpful assistant."
+
+
+def _tool_env(bot: "Bot", chat_id: int | None) -> dict:
+    """Environment for the bash tool: shared + agent-local tools on PATH, plus
+    the TELEGRAM_* vars that remind/schedule/food tools rely on."""
     env = os.environ.copy()
     tool_dirs = []
     if TOOLS_DIR.exists():
@@ -223,40 +173,131 @@ def run_agent(workdir: Path, keep_context: bool, prompt: str,
             str(d) for d in TOOLS_DIR.iterdir()
             if d.is_dir() and d.name != "shared"
         )
-    local_tools = workdir / "tools"
+    local_tools = bot.workdir / "tools"
     if local_tools.is_dir():
         tool_dirs.insert(0, str(local_tools))  # agent-local tools take priority
     if tool_dirs:
         env["PATH"] = os.pathsep.join(tool_dirs) + os.pathsep + env.get("PATH", "")
     if chat_id is not None:
         env["TELEGRAM_CHAT_ID"] = str(chat_id)
-    if token is not None:
-        env["TELEGRAM_BOT_TOKEN"] = token
-    if BRIDGE_INTERNAL_URL:
-        env["BRIDGE_INTERNAL_URL"] = BRIDGE_INTERNAL_URL
+    env["TELEGRAM_BOT_TOKEN"] = bot.token
+    return env
+
+
+def _build_model(model_str: str | None):
+    """Map an agents.yaml model (e.g. 'openai/gpt-5.5') to a Pydantic AI model.
+
+    OpenAI models use the Responses API so native web search is available.
+    Returns (model, web_search_supported).
+    """
+    name = model_str or "openai/gpt-4o-mini"
+    provider, _, rest = name.partition("/")
+    if provider == "openai" and rest:
+        return OpenAIResponsesModel(rest), True
+    # Other providers: let Pydantic AI infer the model; no native web search.
+    return name.replace("/", ":", 1), False
+
+
+def _build_agent(bot: "Bot") -> Agent:
+    """Construct the agent for one run: model, system prompt, and tools.
+
+    Built fresh per run so AGENTS.md / shared-instruction edits take effect
+    without restarting the bridge (cheap next to the model call itself)."""
+    model_obj, web_search = _build_model(bot.model)
+    capabilities = [NativeTool(WebSearchTool())] if web_search else []
+    agent = Agent(
+        model_obj,
+        deps_type=Deps,
+        # Allow None so a truly empty final response is a valid end-of-run. Our
+        # agents reply through the chat_respond tool and then have nothing left to
+        # say; without this, Pydantic AI treats the empty response as non-actionable.
+        output_type=str | None,
+        system_prompt=_system_prompt(bot.workdir),
+        model_settings=ModelSettings(timeout=float(bot.timeout)),
+        capabilities=capabilities,
+        # Kept low: after replying via chat_respond some models emit empty text
+        # instead of ending cleanly, and each output retry is a wasted round-trip.
+        # dedupe (in chat_respond) + the catch in run_agent handle the fallout.
+        retries=1,
+    )
+
+    @agent.tool
+    def bash(ctx: RunContext[Deps], command: str) -> str:
+        """Run a shell command in your working directory and return its combined
+        stdout/stderr. Use this for reading and writing your files and for your
+        CLI tools (e.g. food-add, food-check, remind, schedule)."""
+        env = _tool_env(ctx.deps.bot, ctx.deps.chat_id)
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=ctx.deps.bot.workdir,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=BASH_TIMEOUT, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return f"(command timed out after {BASH_TIMEOUT}s)"
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        return out or "(no output)"
+
+    @agent.tool
+    def chat_respond(ctx: RunContext[Deps], text: str) -> str:
+        """Send a message to the user in Telegram — the ONLY way to reach them
+        (your own final text is not shown). Call once per message; call again only
+        for a genuinely different follow-up. Supports Telegram HTML and the
+        [[buttons: ...]], [[inline: ...]], [[keyboard: ...]] and [[send: path]]
+        markers. Use a literal \\n for line breaks. After sending, end your turn."""
+        text = text.replace("\\n", "\n").replace("\\t", "\t")
+        key = text.strip()
+        # Guard against re-sending the same message: some models re-call this tool
+        # instead of ending their turn, which would spam the user with duplicates.
+        if key and key in ctx.deps.sent:
+            return "You already sent that exact message. You are done — stop now."
+        try:
+            if deliver(ctx.deps.bot, ctx.deps.chat_id, text):
+                ctx.deps.responded = True
+                ctx.deps.sent.add(key)
+                return "Message sent. You are done — end your turn now."
+            return "Nothing to send (message was empty after processing)."
+        except Exception as e:
+            return f"Failed to send message: {e}"
+
+    return agent
+
+
+def run_agent(bot: "Bot", prompt: str, chat_id: int,
+              proactive: bool = False) -> tuple[str, bool]:
+    """Run one prompt through the bot's Pydantic AI agent.
+
+    Returns (final_output_text, responded). `responded` is True when the agent
+    delivered at least one message via chat_respond; the worker uses the text as
+    a fallback only when it didn't.
+    """
+    deps = Deps(bot=bot, chat_id=chat_id)
     t0 = time.monotonic()
+    output, usage_str = "", ""
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",  # opencode emits UTF-8; don't decode as cp1252 on Windows
-            errors="replace",
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        _log_invocation(agent_name, chat_id, prompt, "", "", time.monotonic() - t0)
-        return f"Agent timed out after {timeout}s."
-    _log_invocation(agent_name, chat_id, prompt,
-                    result.stdout or "", result.stderr or "",
+        agent = _build_agent(bot)
+        result = asyncio.run(agent.run(
+            prompt, deps=deps,
+            usage_limits=UsageLimits(request_limit=AGENT_REQUEST_LIMIT),
+        ))
+        output = (result.output or "").strip()
+        with contextlib.suppress(Exception):
+            usage_str = str(result.usage())
+    except UnexpectedModelBehavior as e:
+        # Most commonly "Exceeded maximum output retries": the model kept emitting
+        # empty text after finishing via chat_respond instead of ending its turn.
+        # If it already delivered, that's benign — dedupe stopped any duplicates.
+        if deps.responded:
+            print(f"[{bot.name}] agent ended noisily but delivered; ignoring: {e}")
+        else:
+            output = f"[agent error] {e}"
+            print(f"[{bot.name}] agent run error: {e}")
+    except Exception as e:
+        output = f"[agent error] {e}"
+        print(f"[{bot.name}] agent run error: {e}")
+    _log_invocation(bot.name, chat_id, prompt, output, usage_str,
                     time.monotonic() - t0)
-    answer = extract_answer(result.stdout or "")
-    if answer:
-        return answer
-    err = (result.stderr or "").strip()
-    return f"[agent error]\n{err}" if err else "(no output)"
+    return output, deps.responded
 
 
 # --------------------------------------------------------------------------- #
@@ -542,6 +583,29 @@ def send_file(api: str, chat_id: int, path: Path) -> None:
         )
 
 
+def deliver(bot: "Bot", chat_id: int, text: str) -> bool:
+    """Process outgoing markers in `text` and send it to Telegram.
+
+    Shared by the native chat_respond tool and the worker's fallback path.
+    Returns True if a text message was sent (files-only / empty returns False).
+    """
+    clean, to_send = split_outgoing(text, bot.workdir)
+    clean, button_labels = split_buttons(clean)
+    clean, inline_labels = split_inline(clean)
+    clean, kbd = split_keyboard(clean)
+    sent = False
+    if clean:
+        send(bot.api, chat_id, clean,
+             buttons=button_labels or None,
+             inline_buttons=inline_labels or None,
+             reply_keyboard=kbd)
+        log_turn(bot, chat_id, None, clean)
+        sent = True
+    for path in to_send:
+        send_file(bot.api, chat_id, path)
+    return sent
+
+
 @contextlib.contextmanager
 def typing_indicator(api: str, chat_id: int):
     """Keep Telegram's 'typing...' visible for the whole block.
@@ -634,32 +698,14 @@ def worker(bot: Bot) -> None:
                     history = read_history(bot, chat_id, bot.history)
                     if history:
                         prompt = history_block(history)
-                with _chat_responded_lock:
-                    _chat_responded[(bot.token, chat_id)] = False
                 with AGENT_SLOTS:  # global cap: at most N agents running at once
-                    reply = run_agent(
-                        bot.workdir, bot.keep_context, prompt,
-                        model=bot.model, timeout=bot.timeout, chat_id=chat_id,
-                        token=bot.token, agent_name=bot.name,
-                    )
-            # Agents are instructed to use chat_respond for all output.
-            # If the model skips the tool and outputs text directly (happens
-            # with long contexts), fall back to sending that text so the user
-            # is never left with silence.
-            clean, to_send = split_outgoing(reply, bot.workdir)
-            clean, button_labels = split_buttons(clean)
-            clean, inline_labels = split_inline(clean)
-            clean, kbd = split_keyboard(clean)
-            with _chat_responded_lock:
-                used_chat_respond = _chat_responded.get((bot.token, chat_id), False)
-            if clean and not used_chat_respond and not proactive:
-                send(bot.api, chat_id, clean,
-                     buttons=button_labels or None,
-                     inline_buttons=inline_labels or None,
-                     reply_keyboard=kbd)
-                log_turn(bot, chat_id, None, clean)
-            for path in to_send:
-                send_file(bot.api, chat_id, path)
+                    output, responded = run_agent(bot, prompt, chat_id, proactive)
+            # Agents are instructed to reply via the chat_respond tool. If the
+            # model skips it and returns text directly, fall back to delivering
+            # that text so the user is never left with silence. On proactive
+            # runs a silent agent is intentional — don't surface fallback text.
+            if output and not responded and not proactive:
+                deliver(bot, chat_id, output)
         except Exception as e:  # never let one bad message kill the worker
             print(f"[{bot.name}] worker error:", e)
             try:
@@ -888,8 +934,7 @@ def handle_command(bot: Bot, chat_id: int, text: str) -> bool:
                     pass
         lines = [
             f"Agent: {bot.name}",
-            f"Modell: {bot.model or '(opencode Standard)'}",
-            f"Sitzung: {'kontinuierlich' if bot.keep_context else 'zustandslos'}",
+            f"Modell: {bot.model or '(Standard)'}",
             f"Verlauf: {bot.history} Nachrichten" if bot.history else "Verlauf: aus",
             f"Ausstehende Erinnerungen: {n_reminders}",
             f"Geplante Ausführungen: {n_scheduled}",
@@ -1453,8 +1498,8 @@ def load_config():
                 f"Bot '{name}': allowed_ids is empty -- refusing to run an open bot."
             )
 
-        keep_context = bool(entry.get("continue", False))
-        model = entry.get("model")  # None => opencode uses its configured default
+        keep_context = bool(entry.get("continue", False))  # legacy; no longer used
+        model = entry.get("model")  # None => _build_model falls back to a default
         timeout = int(entry.get("timeout", RUN_TIMEOUT))
 
         schedules = entry.get("schedules") or []
@@ -1518,90 +1563,16 @@ def register_commands(bot: "Bot") -> None:
         print(f"[{bot.name}] setMyCommands error: {e}")
 
 
-class _InternalHandler(BaseHTTPRequestHandler):
-    """Handle POST /send requests from the chat_respond tool.
-
-    chat_respond posts JSON {token, chat_id, text} here. The bridge looks up
-    the bot by token, processes markers (buttons, inline keyboards, file sends),
-    and delivers the message exactly as if it came from the worker.
-    """
-
-    def do_POST(self) -> None:
-        if self.path != "/send":
-            self.send_response(404)
-            self.end_headers()
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            body = json.loads(self.rfile.read(length))
-        except Exception:
-            self.send_response(400)
-            self.end_headers()
-            return
-
-        token   = body.get("token", "")
-        text    = body.get("text", "")
-        chat_id = body.get("chat_id")
-        bot     = _bots_by_token.get(token)
-        if not bot or chat_id is None:
-            self.send_response(400)
-            self.end_headers()
-            return
-
-        clean = ""
-        try:
-            chat_id = int(chat_id)
-            clean, to_send = split_outgoing(text, bot.workdir)
-            clean, button_labels = split_buttons(clean)
-            clean, inline_labels = split_inline(clean)
-            clean, kbd           = split_keyboard(clean)
-            if clean:
-                send(bot.api, chat_id, clean,
-                     buttons=button_labels or None,
-                     inline_buttons=inline_labels or None,
-                     reply_keyboard=kbd)
-            for path in to_send:
-                send_file(bot.api, chat_id, path)
-        except Exception as e:
-            print(f"[internal] send error: {e}")
-            self.send_response(500)
-            self.end_headers()
-            return
-
-        # Log after confirming delivery — separate try so a logging failure
-        # never causes a 500 that would break chat_respond in the agent.
-        if clean:
-            with _chat_responded_lock:
-                _chat_responded[(bot.token, chat_id)] = True
-            try:
-                log_turn(bot, chat_id, None, clean)
-            except Exception as e:
-                print(f"[internal] log error: {e}")
-
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, *args) -> None:
-        pass  # suppress HTTP access log
-
-
-def start_internal_server() -> int:
-    """Start the internal send server on localhost. Returns the bound port."""
-    server = ThreadingHTTPServer(("127.0.0.1", INTERNAL_PORT), _InternalHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server.server_address[1]
-
-
 def main() -> None:
-    global AGENT_SLOTS, BRIDGE_INTERNAL_URL, _bots_by_token
+    global AGENT_SLOTS
     concurrency, bots = load_config()
     AGENT_SLOTS = threading.Semaphore(concurrency)
-    port = start_internal_server()
-    BRIDGE_INTERNAL_URL = f"http://127.0.0.1:{port}"
-    _bots_by_token = {bot.token: bot for bot in bots}
+    if not OPENAI_API_KEY:
+        print("WARNING: OPENAI_API_KEY is not set — agent runs and voice "
+              "transcription will fail until it is added to .env.")
     print(
         f"Starting {len(bots)} bot(s); max {concurrency} agent(s) at once. "
-        f"opencode={OPENCODE}  internal={BRIDGE_INTERNAL_URL}"
+        f"request_limit={AGENT_REQUEST_LIMIT}/run"
     )
     for bot in bots:
         register_commands(bot)

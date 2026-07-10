@@ -1,6 +1,6 @@
 ﻿# Agent Space
 
-A multi-agent Telegram bridge. Run several personal AI agents as independent Telegram bots — each with its own personality, working directory, and memory — all driven by a single Python process backed by [OpenCode](https://opencode.ai).
+A multi-agent Telegram bridge. Run several personal AI agents as independent Telegram bots — each with its own personality, working directory, and memory — all driven by a single Python process built on [Pydantic AI](https://ai.pydantic.dev).
 
 Comes with a web UI for managing agents, editing agent instructions, and scheduling reminders without touching config files.
 
@@ -11,9 +11,9 @@ Comes with a web UI for managing agents, editing agent instructions, and schedul
 Each agent is a Telegram bot with:
 - its own **`AGENTS.md`** defining its role and personality
 - its own **working directory** where it can read/write files
-- its own **session state** (stateless or persistent memory)
+- its own **model** and replayed conversation history
 
-When a message arrives, the bridge runs `opencode run` in the agent's directory. The model sees the agent's instructions, any conversation history you've configured, and the message. Its reply is sent back to Telegram.
+When a message arrives, the bridge runs a **Pydantic AI** agent in-process, scoped to the agent's directory. The model sees the shared + agent-specific instructions, any conversation history you've configured, and the message. Each agent has three tools: **`chat_respond`** (send a Telegram message), **`bash`** (run shell commands / the agent's CLI tools in its workdir), and **web search** (OpenAI native). Replies reach the user through `chat_respond`.
 
 The bridge is one Python process with three threads per agent (poller, worker, scheduler) and a global concurrency cap so it runs comfortably on a Raspberry Pi.
 
@@ -24,8 +24,7 @@ The bridge is one Python process with three threads per agent (poller, worker, s
 | Requirement | Version | Notes |
 |---|---|---|
 | Python | 3.10+ | `python3 --version` |
-| Node.js | 18+ | for OpenCode |
-| [OpenCode](https://opencode.ai) | latest | `npm install -g opencode-ai` |
+| An OpenAI API key | — | powers the agent model (Responses API + web search) and voice transcription |
 | A Telegram account | — | to create bots and find your chat ID |
 
 ---
@@ -48,11 +47,12 @@ python3 -m venv .venv
 cd ..
 ```
 
-### 3. OpenCode
+### 3. OpenAI API key
 
-```bash
-npm install -g opencode-ai
-opencode auth login   # follow the prompts to authenticate with your AI provider
+The agent model and voice transcription use OpenAI. Put your key in `.env` (see Step 3 of Quick start below):
+
+```
+OPENAI_API_KEY=sk-...
 ```
 
 ### 4. Make tool wrappers executable (Linux / macOS)
@@ -88,10 +88,11 @@ cd agent-telegram-bridge
 cp .env.example .env
 ```
 
-Edit `.env` and set your bot token:
+Edit `.env` and set your bot token and OpenAI key:
 
 ```
 EXAMPLE_BOT_TOKEN=123456:ABC-your-token-here
+OPENAI_API_KEY=sk-...
 ```
 
 ### Step 4 — Configure agents
@@ -255,7 +256,7 @@ dir=$(dirname "$0")
 exec python3 "$dir/my-tool.py" "$@"
 ```
 
-Any new tool subfolder is picked up automatically — no bridge restart needed for PATH changes (takes effect on the next `opencode run`).
+Any new tool subfolder is picked up automatically — no bridge restart needed for PATH changes (takes effect on the agent's next run). Agents call these tools through the **`bash`** tool.
 
 ---
 
@@ -269,9 +270,9 @@ agents:
     token_env: EXAMPLE_BOT_TOKEN  # name of the env var holding the Telegram token
     allowed_ids: [12345678]  # whitelist of Telegram chat IDs; empty = bridge won't start
     workdir: /path/to/agent  # agent's working directory (must be outside bridge folder)
-    continue: false          # true = keep OpenCode session memory across messages
-    model: openai/gpt-4o-mini  # provider/model passed to opencode; omit for default
-    timeout: 300             # seconds before the agent run is killed
+    continue: false          # retained for compatibility; no longer has an effect
+    model: openai/gpt-4o-mini  # provider/model; OpenAI models use the Responses API
+    timeout: 300             # per model-request timeout (seconds)
     history: 20              # replay last N messages as context (0 = off)
     schedules:               # optional cron-triggered proactive runs
       - cron: "0 8 * * *"
@@ -279,7 +280,7 @@ agents:
         chat_id: 12345678    # optional; defaults to the first entry in allowed_ids
 ```
 
-`continue` and `history` are independent. `continue` keeps the full OpenCode session (tool call history, file state); `history` replays the last N Telegram messages as plain text context. Both can be on at once, but usually one or the other is enough.
+Memory is provided by `history`: the bridge replays the last N Telegram messages (it logs the conversation itself) as context on each run. The `continue` field is kept so old configs still load, but it no longer does anything — sessions were an OpenCode concept. Use `history` to give an agent context. `model` should be an `openai/*` model to get web search (they run on the OpenAI Responses API); other providers work but without native web search.
 
 ---
 
@@ -296,10 +297,7 @@ cd agent-space
 Then manually:
 
 ```bash
-# Authenticate OpenCode (interactive)
-opencode auth login
-
-# Secrets
+# Secrets (bot tokens + OPENAI_API_KEY)
 cp agent-telegram-bridge/.env.example agent-telegram-bridge/.env
 nano agent-telegram-bridge/.env
 
@@ -343,8 +341,9 @@ If `requirements.txt` did not change, the pip step is a no-op and adds only a fe
 
 | Symptom | Fix |
 |---|---|
-| `opencode CLI not found` | `npm install -g opencode-ai` or set `OPENCODE_BIN` in `.env` |
-| Multi-line prompts cut off (Windows) | Set `OPENCODE_BIN` to `opencode.exe`, not the `.cmd` shim |
+| `No module named 'pydantic_ai'` | `pip install -r requirements.txt` into the interpreter that runs the bridge (the venv, if you use one) |
+| `OPENAI_API_KEY is not set` at startup | Add `OPENAI_API_KEY` to `.env` — agent runs and transcription need it |
+| Web search / recipe cron fails | Model must be an `openai/*` model (uses the Responses API); check `OPENAI_API_KEY` |
 | Bot ignores messages | Chat ID not in `allowed_ids` — check logs for "ignored message from" |
 | Bridge refuses to start | `workdir` is inside the bridge folder, or `allowed_ids` is empty |
 | Voice transcription fails | `OPENAI_API_KEY` missing from `.env` |

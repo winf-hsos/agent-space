@@ -2,6 +2,7 @@ requests
 python-dotenv
 pyyaml
 croniter       # only needed for cron `schedules` in bots.yaml
+pydantic-ai-slim[openai]   # agent runtime (OpenAI Responses API + native web search)
 
 # Web UI
 fastapi

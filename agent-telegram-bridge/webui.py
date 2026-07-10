@@ -842,7 +842,6 @@ async def save_settings(
     concurrency: int = Form(1),
     openai_api_key: str = Form(""),
     transcribe_model: str = Form(""),
-    opencode_bin: str = Form(""),
 ):
     cfg = _load_raw()
     cfg["concurrency"] = max(1, concurrency)
@@ -851,8 +850,6 @@ async def save_settings(
         _set_env("OPENAI_API_KEY", openai_api_key.strip())
     if transcribe_model.strip():
         _set_env("TRANSCRIBE_MODEL", transcribe_model.strip())
-    if opencode_bin.strip():
-        _set_env("OPENCODE_BIN", opencode_bin.strip())
     return RedirectResponse("/settings", status_code=303)
 
 

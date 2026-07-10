@@ -55,26 +55,6 @@
         </div>
       </div>
 
-      <!-- OpenCode -->
-      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-        <h2 class="text-sm font-semibold text-slate-300 mb-1">OpenCode</h2>
-        <p class="text-xs text-slate-500 mb-4">Saved to <code class="text-slate-400">.env</code>. Only needed if auto-detection fails (common on Windows).</p>
-        <div>
-          <label class="text-xs text-slate-500 block mb-1.5">
-            OpenCode binary path
-            {% if env.get('OPENCODE_BIN') %}
-            <span class="text-green-500">✓ set: {{ env.OPENCODE_BIN }}</span>
-            {% else %}
-            <span class="text-slate-600">auto-detect</span>
-            {% endif %}
-          </label>
-          <input name="opencode_bin" type="text"
-                 placeholder="C:\Users\you\AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode.exe"
-                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
-          <p class="text-xs text-slate-600 mt-1">Point to the .exe (not .cmd) on Windows to avoid multi-line prompt truncation.</p>
-        </div>
-      </div>
-
     </div>
 
     <!-- Sidebar -->

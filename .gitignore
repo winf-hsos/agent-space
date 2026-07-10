@@ -14,9 +14,6 @@ agents/*/
 !agents/example-agent/
 !agents/example-agent/**
 
-# ── OpenCode session state (machine-specific) ─────────────────────────────────
-**/opencode.json
-
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

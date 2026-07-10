@@ -10,7 +10,7 @@
 #   4. Logs:  journalctl -u telegram-agents -f
 
 [Unit]
-Description=Telegram -> OpenCode multi-bot bridge
+Description=Telegram multi-bot bridge (Pydantic AI)
 After=network-online.target
 Wants=network-online.target
 
@@ -19,8 +19,6 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/telegram-agents
 EnvironmentFile=/home/pi/telegram-agents/.env
-# Ensure the opencode binary is on PATH for this service user:
-Environment=PATH=/home/pi/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/pi/telegram-agents/.venv/bin/python /home/pi/telegram-agents/telegram_agent.py
 Restart=on-failure
 RestartSec=5

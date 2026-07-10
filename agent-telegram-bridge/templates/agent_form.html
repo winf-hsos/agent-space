@@ -15,7 +15,7 @@
     {% if agent %}Edit Agent{% else %}New Agent{% endif %}
   </h1>
   {% if not agent %}
-  <p class="text-slate-500 text-sm mt-1">Configure a new agent backed by an OpenCode model.</p>
+  <p class="text-slate-500 text-sm mt-1">Configure a new agent.</p>
   {% endif %}
 </div>
 
@@ -55,7 +55,7 @@
                    value="{{ agent.model if agent and agent.model else '' }}"
                    placeholder="openai/gpt-4o-mini"
                    class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:border-indigo-500 placeholder-slate-600">
-            <p class="text-xs text-slate-600 mt-1">provider/model format. Leave blank for OpenCode's default.</p>
+            <p class="text-xs text-slate-600 mt-1">provider/model format. Use an <code>openai/*</code> model for web search. Leave blank for the default.</p>
           </div>
         </div>
       </div>
@@ -153,7 +153,7 @@
                 <span class="text-sm text-slate-300">Continue session</span>
               </label>
             </div>
-            <p class="text-xs text-slate-600 mt-1.5">Stateless: agent recalls via its files. Continue: OpenCode keeps the conversation in memory.</p>
+            <p class="text-xs text-slate-600 mt-1.5">Legacy setting — no longer has an effect. Use <b>History</b> below to give the agent memory (replayed past messages).</p>
           </div>
 
           <div>
