@@ -62,9 +62,10 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, capture_run_messages
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.messages import ModelRequest, ModelResponse
 from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.native_tools import WebSearchTool
 from pydantic_ai.settings import ModelSettings
@@ -102,6 +103,8 @@ BASH_TIMEOUT = int(os.environ.get("BASH_TIMEOUT", "120"))
 # Logs full prompt + final output + usage per run to logs/<agent>.log
 AGENT_LOG = os.environ.get("AGENT_LOG", "0").strip().lower() in ("1", "true", "yes")
 AGENT_LOG_DIR = Path(os.environ.get("AGENT_LOG_DIR", BRIDGE_DIR / "logs"))
+# Max characters shown per tool arg / tool result / text snippet in the trace.
+AGENT_LOG_MAXLEN = int(os.environ.get("AGENT_LOG_MAXLEN", "800"))
 
 # Voice transcription (OpenAI Whisper API). Needs OPENAI_API_KEY in the env.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -123,29 +126,147 @@ class Deps:
     bot: "Bot"
     chat_id: int
     responded: bool = False              # True once chat_respond delivers a message
-    sent: set = field(default_factory=set)  # texts already delivered this run (dedupe)
+    sent: set = field(default_factory=set)     # texts already delivered (dedupe)
+    delivered: list = field(default_factory=list)  # texts actually sent, in order (for the log)
 
 
-def _log_invocation(agent_name: str, chat_id: int | None, prompt: str,
-                    output: str, usage: str, duration: float) -> None:
-    """Append one agent run to logs/<agent_name>.log (no-op when AGENT_LOG is off)."""
+def _oneline(value, limit: int = AGENT_LOG_MAXLEN) -> str:
+    """Collapse a value to a single truncated line for the log."""
+    s = "" if value is None else str(value)
+    s = s.replace("\r\n", "\\n").replace("\n", "\\n").replace("\t", "\\t")
+    if len(s) > limit:
+        s = s[:limit] + f"… (+{len(s) - limit} chars)"
+    return s
+
+
+def _tail(text: str, limit: int) -> str:
+    """Keep the last `limit` chars (the newest history / the triggering message)."""
+    text = text.rstrip()
+    if len(text) <= limit:
+        return text
+    return f"…(+{len(text) - limit} chars above)…\n" + text[-limit:]
+
+
+def _part_args(part) -> str:
+    """Render a tool call's arguments as k=v, truncated."""
+    try:
+        d = part.args_as_dict()
+    except Exception:
+        return _oneline(getattr(part, "args", ""))
+    return ", ".join(f"{k}={_oneline(v)}" for k, v in d.items())
+
+
+def _render_message(msg, step: list) -> list:
+    """Render one ModelRequest/ModelResponse into log lines. `step` is a 1-item
+    list used as a mutable counter."""
+    lines = []
+    if isinstance(msg, ModelResponse):
+        step[0] += 1
+        u = msg.usage
+        tok = (f"in={u.input_tokens} out={u.output_tokens}"
+               f" cache_r={u.cache_read_tokens}") if u else "usage=?"
+        fin = f" · stop={msg.finish_reason}" if msg.finish_reason else ""
+        lines.append(f"  step {step[0]} · {msg.model_name or '?'} · {tok}{fin}")
+        had_part = False
+        for p in msg.parts:
+            kind = getattr(p, "part_kind", "")
+            if kind == "thinking":
+                if (p.content or "").strip():
+                    lines.append(f"      💭 {_oneline(p.content)}")
+                    had_part = True
+            elif kind in ("tool-call", "builtin-tool-call"):
+                name = p.tool_name
+                icon = "🔎" if "search" in name.lower() else "🔧"
+                lines.append(f"      {icon} {name}({_part_args(p)})")
+                had_part = True
+            elif kind == "text":
+                if (p.content or "").strip():
+                    lines.append(f"      💬 text: {_oneline(p.content)}")
+                    had_part = True
+        if not had_part:
+            lines.append("      (no actionable parts — empty response)")
+    elif isinstance(msg, ModelRequest):
+        for p in msg.parts:
+            kind = getattr(p, "part_kind", "")
+            if kind in ("tool-return", "builtin-tool-return"):
+                lines.append(f"        → {p.tool_name}: {_oneline(p.content)}")
+            elif kind == "retry-prompt":
+                lines.append(f"      ↻ retry: {_oneline(p.content)}")
+            # user-prompt / system-prompt handled in the header, skipped here
+    return lines
+
+
+def _sum_usage(messages) -> dict:
+    """Aggregate token usage and counts across all ModelResponse messages."""
+    tot = {"requests": 0, "tools": 0, "input": 0, "output": 0,
+           "cache_read": 0, "cache_write": 0}
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            tot["requests"] += 1
+            tot["tools"] += sum(
+                1 for p in msg.parts
+                if getattr(p, "part_kind", "") in ("tool-call", "builtin-tool-call")
+            )
+            u = msg.usage
+            if u:
+                tot["input"] += u.input_tokens or 0
+                tot["output"] += u.output_tokens or 0
+                tot["cache_read"] += u.cache_read_tokens or 0
+                tot["cache_write"] += u.cache_write_tokens or 0
+    return tot
+
+
+def _log_invocation(bot: "Bot", chat_id: int | None, prompt: str, messages: list,
+                    deps: "Deps", duration: float, proactive: bool,
+                    end_status: str) -> None:
+    """Append a detailed trace of one agent run to logs/<agent>.log.
+
+    Walks the full Pydantic AI message history so the log shows every model step,
+    the tools it called (with arguments), the truncated tool results, token usage
+    per step and in total, and what was actually delivered to the user (from
+    `deps.delivered`, so deduped re-sends aren't miscounted). No-op if AGENT_LOG
+    is off. Never raises — logging must not break a run.
+    """
     if not AGENT_LOG:
         return
-    AGENT_LOG_DIR.mkdir(exist_ok=True)
-    log_file = AGENT_LOG_DIR / f"{agent_name}.log"
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bar = "=" * 72
-    with log_file.open("a", encoding="utf-8") as fh:
-        fh.write(f"\n{bar}\n")
-        fh.write(f"{ts}  agent={agent_name}  chat={chat_id}  duration={duration:.1f}s\n")
-        if usage:
-            fh.write(f"usage: {usage}\n")
-        fh.write(f"{bar}\n")
-        fh.write("PROMPT\n------\n")
-        fh.write(prompt.rstrip() + "\n")
-        fh.write("\nFINAL OUTPUT (fallback text; agent replies via chat_respond)\n")
-        fh.write("-" * 59 + "\n")
-        fh.write((output or "(empty)").rstrip() + "\n")
+    try:
+        AGENT_LOG_DIR.mkdir(exist_ok=True)
+        log_file = AGENT_LOG_DIR / f"{bot.name}.log"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        totals = _sum_usage(messages)
+        trigger = "proactive" if proactive else "interactive"
+
+        step = [0]
+        trace_lines = []
+        # System prompt is static per agent — summarise it once instead of dumping.
+        sys_len = 0
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                for p in msg.parts:
+                    if getattr(p, "part_kind", "") == "system-prompt":
+                        sys_len = len(p.content or "")
+            trace_lines += _render_message(msg, step)
+
+        bar = "═" * 80
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n{bar}\n")
+            fh.write(f"{ts} · {bot.name} · chat={chat_id} · {trigger} · end={end_status}\n")
+            fh.write(f"model={bot.model} · duration={duration:.1f}s · "
+                     f"requests={totals['requests']} · tools={totals['tools']}\n")
+            fh.write(f"tokens: input={totals['input']} output={totals['output']} "
+                     f"cache_read={totals['cache_read']} cache_write={totals['cache_write']}\n")
+            fh.write("─" * 80 + "\n")
+            fh.write(f"TRIGGER (prompt {len(prompt)} chars"
+                     f"{f', system prompt {sys_len} chars' if sys_len else ''}):\n")
+            fh.write("  " + _tail(prompt, 1200).replace("\n", "\n  ") + "\n\n")
+            fh.write("TRACE:\n")
+            fh.write(("\n".join(trace_lines) if trace_lines else "  (no messages captured)") + "\n\n")
+            fh.write(f"DELIVERED: {len(deps.delivered)} message(s) to the user\n")
+            for i, d in enumerate(deps.delivered, 1):
+                fh.write(f"  {i}. {_oneline(d)}\n")
+            fh.write(f"OUTCOME: responded={deps.responded} · end={end_status}\n")
+    except Exception as e:  # logging must never break the run
+        print(f"[{bot.name}] logging error: {e}")
 
 
 def _system_prompt(workdir: Path) -> str:
@@ -255,6 +376,7 @@ def _build_agent(bot: "Bot") -> Agent:
             if deliver(ctx.deps.bot, ctx.deps.chat_id, text):
                 ctx.deps.responded = True
                 ctx.deps.sent.add(key)
+                ctx.deps.delivered.append(text)
                 return "Message sent. You are done — end your turn now."
             return "Nothing to send (message was empty after processing)."
         except Exception as e:
@@ -273,30 +395,35 @@ def run_agent(bot: "Bot", prompt: str, chat_id: int,
     """
     deps = Deps(bot=bot, chat_id=chat_id)
     t0 = time.monotonic()
-    output, usage_str = "", ""
-    try:
-        agent = _build_agent(bot)
-        result = asyncio.run(agent.run(
-            prompt, deps=deps,
-            usage_limits=UsageLimits(request_limit=AGENT_REQUEST_LIMIT),
-        ))
-        output = (result.output or "").strip()
-        with contextlib.suppress(Exception):
-            usage_str = str(result.usage())
-    except UnexpectedModelBehavior as e:
-        # Most commonly "Exceeded maximum output retries": the model kept emitting
-        # empty text after finishing via chat_respond instead of ending its turn.
-        # If it already delivered, that's benign — dedupe stopped any duplicates.
-        if deps.responded:
-            print(f"[{bot.name}] agent ended noisily but delivered; ignoring: {e}")
-        else:
+    output, end_status = "", "clean"
+    # capture_run_messages() gives us the full trace even when the run raises,
+    # which is exactly the common "noisy end" case we want to see in the log.
+    with capture_run_messages() as messages:
+        try:
+            agent = _build_agent(bot)
+            result = asyncio.run(agent.run(
+                prompt, deps=deps,
+                usage_limits=UsageLimits(request_limit=AGENT_REQUEST_LIMIT),
+            ))
+            output = (result.output or "").strip()
+        except UnexpectedModelBehavior as e:
+            # Most commonly "Exceeded maximum output retries": the model kept
+            # emitting empty text after finishing via chat_respond instead of
+            # ending its turn. If it already delivered, that's benign — dedupe
+            # stopped any duplicates.
+            if deps.responded:
+                end_status = f"noisy ({e})"
+                print(f"[{bot.name}] agent ended noisily but delivered; ignoring: {e}")
+            else:
+                end_status = f"error ({e})"
+                output = f"[agent error] {e}"
+                print(f"[{bot.name}] agent run error: {e}")
+        except Exception as e:
+            end_status = f"error ({e})"
             output = f"[agent error] {e}"
             print(f"[{bot.name}] agent run error: {e}")
-    except Exception as e:
-        output = f"[agent error] {e}"
-        print(f"[{bot.name}] agent run error: {e}")
-    _log_invocation(bot.name, chat_id, prompt, output, usage_str,
-                    time.monotonic() - t0)
+    _log_invocation(bot, chat_id, prompt, list(messages), deps,
+                    time.monotonic() - t0, proactive, end_status)
     return output, deps.responded
 
 
