@@ -336,17 +336,88 @@ def _build_agent(bot: "Bot") -> Agent:
         system_prompt=_system_prompt(bot.workdir),
         model_settings=ModelSettings(timeout=float(bot.timeout)),
         capabilities=capabilities,
-        # Kept low: after replying via chat_respond some models emit empty text
-        # instead of ending cleanly, and each output retry is a wasted round-trip.
-        # dedupe (in chat_respond) + the catch in run_agent handle the fallout.
-        retries=1,
+        # retries=0: after replying via chat_respond the model emits an empty
+        # response; with retries>0 Pydantic AI sends a "return text" prompt, and
+        # the model answers it by RE-sending a (often reworded) message — a
+        # duplicate the exact-match dedupe can't catch. With 0, that first empty
+        # response ends the run cleanly. Genuine multi-message still works (those
+        # are tool-call turns, which don't consume output-retry budget).
+        retries=0,
     )
+
+    def _safe_target(bot: "Bot", path: str) -> "Path | None":
+        """Resolve `path` under the agent's workdir; None if it escapes."""
+        base = bot.workdir.resolve()
+        target = (base / path).resolve()
+        return target if target == base or base in target.parents else None
+
+    @agent.tool
+    def list_files(ctx: RunContext[Deps], subdir: str = ".") -> str:
+        """List the files and folders in a directory of your working directory
+        (folders end with '/'). Use this to see what data files you have."""
+        target = _safe_target(ctx.deps.bot, subdir)
+        if target is None:
+            return "Error: path is outside your working directory."
+        if not target.is_dir():
+            return f"Error: not a directory: {subdir}"
+        entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+        return "\n".join(entries) or "(empty)"
+
+    @agent.tool
+    def read_file(ctx: RunContext[Deps], path: str) -> str:
+        """Read a UTF-8 text file from your working directory and return its full
+        contents. Prefer this over shell commands for reading your data files."""
+        target = _safe_target(ctx.deps.bot, path)
+        if target is None:
+            return "Error: path is outside your working directory."
+        if not target.is_file():
+            return f"Error: no such file: {path}"
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return f"Error reading {path}: {e}"
+        if len(text) > 20000:
+            text = text[:20000] + f"\n… (+{len(text) - 20000} chars truncated)"
+        return text
+
+    @agent.tool
+    def search_files(ctx: RunContext[Deps], query: str, subdir: str = ".",
+                     extensions: str = ".md,.txt") -> str:
+        """Case-insensitive search for `query` inside the text files under `subdir`
+        (recursively). Returns each matching file with a short snippet around the
+        first hit. Use this to find which file mentions a person, place, or term —
+        it searches file *contents*, not just names."""
+        root = _safe_target(ctx.deps.bot, subdir)
+        if root is None:
+            return "Error: path is outside your working directory."
+        if not root.is_dir():
+            return f"Error: not a directory: {subdir}"
+        exts = {e.strip().lower() for e in extensions.split(",") if e.strip()}
+        q = query.lower()
+        base = ctx.deps.bot.workdir.resolve()
+        hits = []
+        for p in sorted(root.rglob("*")):
+            if not p.is_file() or (exts and p.suffix.lower() not in exts):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            idx = text.lower().find(q)
+            if idx != -1:
+                s = max(0, idx - 60)
+                snippet = text[s:idx + len(query) + 60].replace("\n", " ").strip()
+                hits.append(f"{p.relative_to(base).as_posix()}: …{snippet}…")
+        return "\n".join(hits) if hits else f"No files under '{subdir}' contain '{query}'."
 
     @agent.tool
     def bash(ctx: RunContext[Deps], command: str) -> str:
         """Run a shell command in your working directory and return its combined
-        stdout/stderr. Use this for reading and writing your files and for your
-        CLI tools (e.g. food-add, food-check, remind, schedule)."""
+        stdout/stderr. Use this for your CLI tools (food-add, food-check, remind,
+        schedule) and other actions — NOT for reading files (use read_file /
+        search_files / list_files instead, they are far more reliable).
+        Keep each command to a SINGLE line: heredocs (<<) and multi-line scripts
+        are not supported and will fail."""
         env = _tool_env(ctx.deps.bot, ctx.deps.chat_id)
         try:
             r = subprocess.run(
@@ -407,13 +478,12 @@ def run_agent(bot: "Bot", prompt: str, chat_id: int,
             ))
             output = (result.output or "").strip()
         except UnexpectedModelBehavior as e:
-            # Most commonly "Exceeded maximum output retries": the model kept
-            # emitting empty text after finishing via chat_respond instead of
-            # ending its turn. If it already delivered, that's benign — dedupe
-            # stopped any duplicates.
+            # With retries=0 this is the NORMAL termination: after replying via
+            # chat_respond the model emits an empty response, which Pydantic AI
+            # can't turn into output, so it raises. If we already delivered, the
+            # run succeeded — this is expected, not an error.
             if deps.responded:
-                end_status = f"noisy ({e})"
-                print(f"[{bot.name}] agent ended noisily but delivered; ignoring: {e}")
+                end_status = "ok (empty final response)"
             else:
                 end_status = f"error ({e})"
                 output = f"[agent error] {e}"
