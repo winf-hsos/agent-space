@@ -62,7 +62,7 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
-from pydantic_ai import Agent, RunContext, capture_run_messages
+from pydantic_ai import Agent, BinaryContent, RunContext, ToolReturn, capture_run_messages
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import ModelRequest, ModelResponse
@@ -105,6 +105,14 @@ AGENT_LOG = os.environ.get("AGENT_LOG", "0").strip().lower() in ("1", "true", "y
 AGENT_LOG_DIR = Path(os.environ.get("AGENT_LOG_DIR", BRIDGE_DIR / "logs"))
 # Max characters shown per tool arg / tool result / text snippet in the trace.
 AGENT_LOG_MAXLEN = int(os.environ.get("AGENT_LOG_MAXLEN", "800"))
+# Caps for the download_file / read_document tools (bytes).
+DOWNLOAD_MAX_BYTES = int(os.environ.get("DOWNLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
+DOCUMENT_MAX_BYTES = int(os.environ.get("DOCUMENT_MAX_BYTES", str(25 * 1024 * 1024)))
+# File types the model can read natively (via read_document).
+_DOC_MEDIA_TYPES = {
+    ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
+}
 
 # Voice transcription (OpenAI Whisper API). Needs OPENAI_API_KEY in the env.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -431,6 +439,71 @@ def _build_agent(bot: "Bot") -> Agent:
                 snippet = text[s:idx + len(query) + 60].replace("\n", " ").strip()
                 hits.append(f"{p.relative_to(base).as_posix()}: …{snippet}…")
         return "\n".join(hits) if hits else f"No files under '{subdir}' contain '{query}'."
+
+    @agent.tool
+    def download_file(ctx: RunContext[Deps], url: str, path: str) -> str:
+        """Download a file (e.g. a PDF paper) from `url` and save it in your working
+        directory at `path`. Use this to fetch and keep originals — e.g. a paper's
+        PDF from arXiv. For arXiv, use the direct PDF URL (https://arxiv.org/pdf/<id>),
+        not the abstract page. Returns the saved size and the server's content-type
+        so you can tell whether you actually got a PDF (not an HTML page)."""
+        target = _safe_target(ctx.deps.bot, path)
+        if target is None:
+            return "Error: path is outside your working directory."
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (knowledge-agent)"}
+            with requests.get(url, stream=True, timeout=60, headers=headers) as r:
+                r.raise_for_status()
+                ctype = r.headers.get("content-type", "unknown")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                total = 0
+                with open(target, "wb") as fh:
+                    for chunk in r.iter_content(65536):
+                        total += len(chunk)
+                        if total > DOWNLOAD_MAX_BYTES:
+                            fh.close()
+                            target.unlink(missing_ok=True)
+                            return (f"Error: download exceeds "
+                                    f"{DOWNLOAD_MAX_BYTES // 1024 // 1024} MB limit; aborted.")
+                        fh.write(chunk)
+        except Exception as e:
+            return f"Download failed: {e}"
+        note = ""
+        if "html" in ctype.lower():
+            note = ("  WARNING: content-type is HTML, not a PDF — you probably fetched a "
+                    "landing page. Find the direct file URL and download that instead.")
+        return f"Downloaded to {path} ({total} bytes, content-type: {ctype}).{note}"
+
+    @agent.tool
+    def read_document(ctx: RunContext[Deps], path: str) -> ToolReturn:
+        """Load a PDF or image from your working directory and hand its CONTENTS to
+        you (the model) for native reading — text, tables, figures, and scanned
+        pages. Use this to actually read a paper (e.g. after download_file) instead
+        of guessing from the title. Only PDF and common image files are supported."""
+        target = _safe_target(ctx.deps.bot, path)
+        if target is None:
+            return ToolReturn(return_value="Error: path is outside your working directory.")
+        if not target.is_file():
+            return ToolReturn(return_value=f"Error: no such file: {path}")
+        media = _DOC_MEDIA_TYPES.get(target.suffix.lower())
+        if not media:
+            return ToolReturn(return_value=(
+                f"Error: cannot natively read '{target.suffix}' files — only PDF and "
+                f"images ({', '.join(sorted(_DOC_MEDIA_TYPES))})."))
+        size = target.stat().st_size
+        if size > DOCUMENT_MAX_BYTES:
+            return ToolReturn(return_value=(
+                f"Error: {path} is {size // 1024 // 1024} MB, over the "
+                f"{DOCUMENT_MAX_BYTES // 1024 // 1024} MB limit for native reading. "
+                f"The original is still saved; summarise from metadata instead."))
+        try:
+            data = target.read_bytes()
+        except Exception as e:
+            return ToolReturn(return_value=f"Error reading {path}: {e}")
+        return ToolReturn(
+            return_value=f"Loaded {path} ({size} bytes); its contents are attached below.",
+            content=[BinaryContent(data=data, media_type=media, identifier=target.name)],
+        )
 
     @agent.tool
     def bash(ctx: RunContext[Deps], command: str) -> str:

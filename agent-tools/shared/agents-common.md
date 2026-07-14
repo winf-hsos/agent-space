@@ -21,10 +21,15 @@ Your tools:
   only way to reach him.
 - **`search_files`** — search the *contents* of your files for a word or name.
   Use this first to find which file mentions someone or something.
-- **`read_file`** — read one file in full.
+- **`read_file`** — read one text file in full.
 - **`write_file`** — create or overwrite a file with its complete new contents.
   The only reliable way to save.
 - **`list_files`** — list the files/folders in a directory.
+- **`download_file`** — download a URL (e.g. a PDF) and save it in your working
+  directory.
+- **`read_document`** — load a saved PDF or image so you can read its actual
+  contents natively (text, tables, figures). Use this to read a file's *contents*;
+  `read_file` only works on text files.
 - **`bash`** — run your CLI commands (`remind`, `schedule`, agent-specific ones
   like `food-add`) and other actions. Keep each command to a **single line** —
   heredocs (`<<`) and multi-line scripts are not supported and will fail.
